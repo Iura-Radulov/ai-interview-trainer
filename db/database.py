@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import config
@@ -161,6 +161,54 @@ async def count_today_sessions(user_id: int) -> int:
         return result.scalar_one()
 
 
+async def check_subscription_limit(telegram_id: int) -> bool:
+    """Check if user can start a new interview based on subscription.
+
+    Reads tariff_plans + subscriptions + users from the shared SQLite.
+    Returns True if the user can proceed, False if limit reached.
+    """
+    async with async_session() as sess:
+        user_result = await sess.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        user = user_result.scalar_one_or_none()
+        if not user:
+            return True  # new users get a grace period
+
+        # Check if user has active subscription via Laravel's tables
+        try:
+            sub_result = await sess.execute(
+                text(
+                    "SELECT tp.max_interviews_per_day "
+                    "FROM subscriptions s "
+                    "JOIN tariff_plans tp ON s.tariff_plan_id = tp.id "
+                    "WHERE s.user_id = :uid AND s.status = 'active' AND s.end_date > datetime('now') "
+                    "ORDER BY s.end_date DESC LIMIT 1"
+                ),
+                {"uid": user.id},
+            )
+            row = sub_result.one_or_none()
+            if row:
+                limit = row[0]
+            else:
+                limit = 2  # free tier
+        except Exception:
+            limit = 2  # fallback
+
+        # Count today's sessions
+        now = datetime.utcnow()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        count_result = await sess.execute(
+            select(func.count(Session.id)).where(
+                Session.user_id == user.id,
+                Session.started_at >= today_start,
+            )
+        )
+        today_count = count_result.scalar_one()
+
+        return today_count < limit
+
+
 async def get_user_stats(telegram_id: int) -> dict:
     """Return a stats dict for the profile command."""
     async with async_session() as sess:
@@ -171,40 +219,65 @@ async def get_user_stats(telegram_id: int) -> dict:
         if not user:
             return {}
 
-        sessions_result = await sess.execute(
+        all_sessions_result = await sess.execute(
             select(Session)
-            .where(and_(Session.user_id == user.id, Session.completed == True))  # noqa: E712
-            .order_by(Session.completed_at.desc())
+            .where(Session.user_id == user.id)
+            .order_by(Session.started_at.desc())
         )
-        sessions = sessions_result.scalars().all()
+        all_sessions = all_sessions_result.scalars().all()
 
-        total = len(sessions)
+        completed_sessions = [s for s in all_sessions if s.completed == True]  # noqa: E712
+        total_all = len(all_sessions)
+        total_completed = len(completed_sessions)
+
         avg = (
-            sum(s.total_score for s in sessions if s.total_score is not None) / total
-            if total > 0
+            sum(s.total_score for s in completed_sessions if s.total_score is not None) / total_completed
+            if total_completed > 0
             else 0.0
         )
 
         role_counts: dict[str, int] = {}
-        for s in sessions:
+        for s in all_sessions:
             role_counts[s.role] = role_counts.get(s.role, 0) + 1
 
         recent = [
             {
+                "id": s.id,
                 "role": s.role,
-                "level": s.experience_level,
-                "score": s.total_score,
-                "date": s.completed_at.strftime("%Y-%m-%d") if s.completed_at else "N/A",
+                "experience_level": s.experience_level,
+                "total_score": s.total_score,
+                "started_at": s.started_at.isoformat() if s.started_at else "",
+                "completed": s.completed,
             }
-            for s in sessions[:5]
+            for s in all_sessions[:10]
         ]
 
         return {
             "user_id": user.id,
             "display_name": user.first_name or user.username or "User",
             "preferred_role": user.preferred_role,
-            "total_sessions": total,
+            "total_sessions": total_all,
             "avg_score": avg,
             "recent_sessions": recent,
             "role_breakdown": role_counts,
         }
+
+
+async def create_auth_token(telegram_id: int) -> str:
+    """Generate a one-time auth token for web login, save to DB, return the token."""
+    import secrets
+    from datetime import datetime, timedelta
+
+    token = secrets.token_urlsafe(32)
+    expires_at = (datetime.utcnow() + timedelta(minutes=5)).isoformat()
+
+    async with async_session() as sess:
+        await sess.execute(
+            text(
+                "INSERT INTO auth_tokens (telegram_id, token, expires_at) "
+                "VALUES (:tid, :tok, :exp)"
+            ),
+            {"tid": telegram_id, "tok": token, "exp": expires_at},
+        )
+        await sess.commit()
+    return token

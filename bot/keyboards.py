@@ -1,7 +1,15 @@
 """Inline keyboard builders for all bot interactions."""
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
 import config
+
+
+def _mini_app_button() -> InlineKeyboardButton:
+    """Mini App button that opens the web app in Telegram."""
+    return InlineKeyboardButton(
+        "🚀 Open Mini App",
+        web_app=WebAppInfo(url=config.MINI_APP_URL),
+    )
 
 
 def role_keyboard() -> InlineKeyboardMarkup:
@@ -39,4 +47,5 @@ def start_role_keyboard() -> InlineKeyboardMarkup:
         for r in config.ROLES
     ]
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([_mini_app_button()])
     return InlineKeyboardMarkup(rows)

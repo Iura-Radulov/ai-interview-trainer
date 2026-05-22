@@ -8,6 +8,7 @@ BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o")
 DATABASE_PATH: str = os.getenv("DATABASE_PATH", "./data/interviews.db")
+MINI_APP_URL: str = os.getenv("MINI_APP_URL", "https://mini.techinterviewai.com")
 MAX_FREE_INTERVIEWS_PER_DAY: int = int(os.getenv("MAX_FREE_INTERVIEWS_PER_DAY", "2"))
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 

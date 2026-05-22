@@ -2,7 +2,7 @@
 import logging
 import sys
 
-from telegram import Update
+from telegram import BotCommand, MenuButtonWebApp, Update, WebAppInfo
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler
 
 import config
@@ -20,11 +20,34 @@ logger = logging.getLogger(__name__)
 
 # Sentinel used by the import-smoke-test: python -c "from bot.main import *; print(OK)"
 OK = "OK"
+MINI_APP_URL = config.MINI_APP_URL
 
 
 async def _post_init(application: Application) -> None:
-    """Run once after the Application is built — initialise the database."""
+    """Run once after the Application is built — init DB + register commands + menu button."""
     await init_db()
+
+    # Register bot commands for the menu button
+    commands = [
+        BotCommand("start", "Register and choose your role"),
+        BotCommand("interview", "Start a new interview session"),
+        BotCommand("profile", "View your stats and history"),
+        BotCommand("feedback", "Send feedback to the developers"),
+        BotCommand("help", "Show help and usage info"),
+    ]
+    await application.bot.set_my_commands(commands)
+
+    # Show an "Open" button at the bottom left that launches the Mini App
+    try:
+        await application.bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(
+                text="Open",
+                web_app=WebAppInfo(url=MINI_APP_URL),
+            )
+        )
+    except Exception:
+        logger.warning("Could not set menu button (old API client?)", exc_info=True)
+
     logger.info("AI Interview Trainer bot is ready.")
 
 
