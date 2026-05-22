@@ -17,8 +17,9 @@ from ai.scoring import format_evaluation_message, format_summary_message
 from bot.keyboards import level_keyboard, role_keyboard
 from bot.states import InterviewState
 from db.database import (
+    check_subscription_limit,
     complete_session,
-    count_today_sessions,
+    count_month_sessions,
     create_session,
     get_or_create_user,
     get_session_answers,
@@ -35,7 +36,7 @@ IN_INTERVIEW = InterviewState.IN_INTERVIEW
 # ── entry point ───────────────────────────────────────────────────────────────
 
 async def start_interview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Begin the interview flow: register user and enforce daily rate limit."""
+    """Begin the interview flow: register user and enforce monthly rate limit."""
     user = update.effective_user
     if user is None:
         return ConversationHandler.END
@@ -46,26 +47,27 @@ async def start_interview(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         first_name=user.first_name,
     )
 
-    today_count = await count_today_sessions(db_user.id)
-    remaining = config.MAX_FREE_INTERVIEWS_PER_DAY - today_count
-
-    if remaining <= 0:
+    # Check monthly subscription limit
+    if not await check_subscription_limit(user.id):
         await update.message.reply_text(
-            f"⚠️ You've reached the daily limit of "
-            f"*{config.MAX_FREE_INTERVIEWS_PER_DAY} interviews*\\.\n\n"
-            "Come back tomorrow to continue practising\\! 🌟\n"
+            f"⚠️ You've reached the monthly limit of "
+            f"*{config.MAX_FREE_INTERVIEWS_PER_MONTH} interviews*\\.\n\n"
+            "Upgrade your plan with /plan to get unlimited access\\! 🚀\n"
             "Review your progress with /profile\\.",
             parse_mode="MarkdownV2",
         )
         return ConversationHandler.END
+
+    month_count = await count_month_sessions(db_user.id)
+    remaining = max(0, config.MAX_FREE_INTERVIEWS_PER_MONTH - month_count)
 
     context.user_data.clear()
     context.user_data["db_user_id"] = db_user.id
 
     await update.message.reply_text(
         f"🎯 *Start New Interview*\n\n"
-        f"Interviews today: *{today_count}* "
-        f"\\({remaining} remaining\\)\\.\n\n"
+        f"Interviews this month: *{month_count}* "
+        f"({remaining} remaining)\\.\n\n"
         "Select your role:",
         parse_mode="MarkdownV2",
         reply_markup=role_keyboard(),

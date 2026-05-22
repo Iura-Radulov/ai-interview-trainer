@@ -99,21 +99,22 @@ async def set_role_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display usage instructions."""
+    """Display usage instructions with MarkdownV2."""
     text = (
-        "*AI Interview Trainer — Help*\\n\\n"
-        "*Commands:*\\n"
-        "/start — register and set your preferred role\\n"
-        "/interview — start a new interview session\\n"
-        "/profile — view your stats and history\\n"
-        "/feedback — send feedback to the developers\\n"
-        "/help — show this message\\n\\n"
-        "*How it works:*\\n"
-        "1\\. Choose your role and experience level\\n"
-        "2\\. Answer 5 AI\\-generated interview questions\\n"
-        "3\\. Receive per\\-answer feedback scored 1–10\\n"
-        "4\\. Get a full session summary with study tips\\n\\n"
-        f"*Daily limit:* {config.MAX_FREE_INTERVIEWS_PER_DAY} interviews per day\\n\\n"
+        "*AI Interview Trainer — Help*\n\n"
+        "*Commands:*\n"
+        "/start — register and set your preferred role\n"
+        "/interview — start a new interview session\n"
+        "/profile — view your stats and history\n"
+        "/plan — view pricing and subscribe\n"
+        "/feedback — send feedback to the developers\n"
+        "/help — show this message\n\n"
+        "*How it works:*\n"
+        "1\\. Choose your role and experience level\n"
+        "2\\. Answer 5 AI‑generated interview questions\n"
+        "3\\. Receive per‑answer feedback scored 1–10\n"
+        "4\\. Get a full session summary with study tips\n\n"
+        f"*Free tier:* {config.MAX_FREE_INTERVIEWS_PER_MONTH} interviews per month\n\n"
         "💡 Answer as you would in a real interview — the more detail, the better the feedback\\!"
     )
     await update.message.reply_text(text, parse_mode="MarkdownV2")

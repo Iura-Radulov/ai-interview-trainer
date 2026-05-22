@@ -170,7 +170,7 @@ async def start_interview(
         if not can_proceed:
             raise HTTPException(
                 status_code=429,
-                detail="Daily interview limit reached. Upgrade to Pro for unlimited access.",
+                detail="Monthly interview limit reached. Upgrade to Pro for unlimited access.",
             )
 
         session_id = await create_session(db_user_id, request.role, request.level)
@@ -320,6 +320,49 @@ async def get_session_detail(
     except Exception as exc:
         logger.error("get_session_detail error: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to get session")
+
+
+@router.get("/interview/{session_id}/next-question")
+async def get_next_question(
+    session_id: int,
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Return the next question for an incomplete session."""
+    try:
+        telegram_id = user_data["id"]
+        db_user_id = await _get_db_user_id(telegram_id)
+
+        # Check subscription limit before resuming
+        if not await check_subscription_limit(telegram_id):
+            raise HTTPException(
+                status_code=429,
+                detail="Monthly interview limit reached. Upgrade to Pro for unlimited access.",
+            )
+
+        session = await _get_owned_session(session_id, db_user_id)
+
+        if session.completed:
+            raise HTTPException(status_code=400, detail="Session already completed")
+
+        existing_answers = await get_session_answers(session_id)
+        next_num = len(existing_answers) + 1
+
+        question = await generate_question(
+            role=session.role,
+            level=session.experience_level,
+            question_number=next_num,
+            previous_questions=[a["question_text"] for a in existing_answers],
+        )
+
+        return {
+            "question": question,
+            "question_number": next_num,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("get_next_question error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to generate next question")
 
 
 @router.get("/profile")

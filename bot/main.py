@@ -3,11 +3,25 @@ import logging
 import sys
 
 from telegram import BotCommand, MenuButtonWebApp, Update, WebAppInfo
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    PreCheckoutQueryHandler,
+    filters,
+)
 
 import config
 from bot.handlers.feedback import build_feedback_handler
 from bot.handlers.interview import build_interview_handler
+from bot.handlers.payments import (
+    pre_checkout_handler,
+    send_stars_invoice,
+    stars_callback,
+    successful_payment_handler,
+)
+from bot.handlers.plan import plan_command
 from bot.handlers.profile import profile_command
 from bot.handlers.start import help_command, set_role_callback, start_command
 from db.database import init_db
@@ -32,6 +46,8 @@ async def _post_init(application: Application) -> None:
         BotCommand("start", "Register and choose your role"),
         BotCommand("interview", "Start a new interview session"),
         BotCommand("profile", "View your stats and history"),
+        BotCommand("plan", "View pricing and subscribe"),
+        BotCommand("pay", "Buy subscription with Telegram Stars"),
         BotCommand("feedback", "Send feedback to the developers"),
         BotCommand("help", "Show help and usage info"),
     ]
@@ -67,9 +83,18 @@ def create_application() -> Application:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("profile", profile_command))
+    app.add_handler(CommandHandler("plan", plan_command))
+    app.add_handler(CommandHandler("pay", send_stars_invoice))
+
+    # ── Telegram Stars payments ───────────────────────────────────────────────
+    app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
     # ── /start role-selection callback ────────────────────────────────────────
     app.add_handler(CallbackQueryHandler(set_role_callback, pattern=r"^set_role_"))
+
+    # ── Stars buy callbacks ────────────────────────────────────────────────────
+    app.add_handler(CallbackQueryHandler(stars_callback, pattern=r"^stars_"))
 
     # ── conversation handlers ─────────────────────────────────────────────────
     app.add_handler(build_interview_handler())

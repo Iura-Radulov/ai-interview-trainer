@@ -58,6 +58,18 @@ class Session(Base):
     )
 
 
+class Feedback(Base):
+    """User feedback messages stored in the shared SQLite."""
+
+    __tablename__ = "feedback"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(Integer, nullable=False)
+    username = Column(String(255), nullable=True)
+    message = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class Answer(Base):
     """A single question-answer pair within a session."""
 

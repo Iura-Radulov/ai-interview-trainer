@@ -10,6 +10,9 @@ from telegram.ext import (
     filters,
 )
 
+import config
+from db.database import save_feedback
+
 logger = logging.getLogger(__name__)
 
 WAITING_FOR_FEEDBACK = 10  # state within this handler only
@@ -27,15 +30,32 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def receive_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Log the feedback and thank the user."""
+    """Save feedback to DB and forward to the admin group."""
     user = update.effective_user
-    text = update.message.text
-    logger.info(
-        "Feedback from user %s (%s): %s",
-        user.id if user else "?",
-        f"@{user.username}" if (user and user.username) else "no username",
-        text,
+    text = update.message.text or ""
+
+    # Save to DB
+    await save_feedback(
+        telegram_id=user.id if user else 0,
+        username=f"@{user.username}" if (user and user.username) else None,
+        message=text,
     )
+
+    # Forward to admin group if configured
+    if config.FEEDBACK_CHAT_ID:
+        try:
+            sender = f"@{user.username}" if (user and user.username) else f"ID {user.id}"
+            await context.bot.send_message(
+                chat_id=config.FEEDBACK_CHAT_ID,
+                text=(
+                    f"📬 New Feedback\n"
+                    f"From: {sender}\n\n"
+                    f"{text}"
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Failed to forward feedback to chat %s: %s", config.FEEDBACK_CHAT_ID, exc)
+
     await update.message.reply_text(
         "✅ *Thank you for your feedback\\!*\n\n"
         "Your message has been recorded and will help us improve the bot\\.\n"

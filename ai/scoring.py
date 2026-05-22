@@ -85,40 +85,38 @@ def format_summary_message(
 
 
 def format_profile_message(stats: dict) -> str:
-    """Build the /profile response message."""
-    if not stats:
-        return "No profile found. Use /start to register first."
+    """Build the /profile response — plan, stats summary, and upgrade prompt."""
+    plan_name = stats.get("plan_name", "Free")
+    max_pm = stats.get("max_per_month", 2)
 
-    total = stats["total_sessions"]
-    avg = stats["avg_score"]
+    # Plan emoji + description
+    if max_pm >= 999999:
+        plan_emoji = {"Free": "🆓", "Pro": "⭐", "Enterprise": "💎"}.get(plan_name, "📋")
+        limit_text = "♾️ Unlimited"
+    else:
+        plan_emoji = {"Free": "🆓", "Pro": "⭐", "Enterprise": "💎"}.get(plan_name, "📋")
+        limit_text = f"{max_pm}/month"
 
     parts = [
         "👤 *Your Profile*",
         "",
-        f"📊 *Interviews completed:* {total}",
+        f"{plan_emoji} *Plan:* {plan_name}  —  {limit_text}",
+        "",
+        f"📊 *Total interviews:* {stats['total_sessions']}",
+        f"✅ *Completed:* {stats['total_completed']}",
+        f"⏳ *Incomplete:* {stats['total_incomplete']}",
     ]
-    if total > 0:
-        parts.append(f"⭐ *Average score:* {avg:.1f}/10 {_bar(avg)}")
 
-    if stats.get("preferred_role"):
-        role = stats["preferred_role"]
-        parts.append(f"🎯 *Preferred role:* {config.ROLE_EMOJIS.get(role, '')} {role}")
+    if stats["total_completed"] > 0:
+        avg = stats["avg_score"]
+        parts.append(f"⭐ *Average score:* {avg:.1f}/10")
+    else:
+        parts.append("⭐ *Average score:* —")
 
-    if stats.get("role_breakdown"):
-        parts += ["", "📈 *Sessions by role:*"]
-        for role, cnt in stats["role_breakdown"].items():
-            parts.append(f"  {config.ROLE_EMOJIS.get(role, '')} {role}: {cnt}")
-
-    if stats.get("recent_sessions"):
-        parts += ["", "🕐 *Recent sessions:*"]
-        for s in stats["recent_sessions"][:3]:
-            score_str = f"{s['score']:.1f}/10" if s["score"] is not None else "—"
-            parts.append(
-                f"  {config.ROLE_EMOJIS.get(s['role'], '')} {s['role']} "
-                f"{s['level']}: {score_str}  ({s['date']})"
-            )
-
-    if total == 0:
-        parts += ["", "👉 Start your first interview with /interview"]
+    parts += [
+        "",
+        "💡 *Want more?*",
+        "Upgrade your plan with /plan",
+    ]
 
     return "\n".join(parts)

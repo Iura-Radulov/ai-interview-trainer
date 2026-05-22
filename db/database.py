@@ -145,16 +145,16 @@ async def get_session_answers(session_id: int) -> list[dict]:
         ]
 
 
-async def count_today_sessions(user_id: int) -> int:
-    """Count sessions started today (UTC) by this user."""
+async def count_month_sessions(user_id: int) -> int:
+    """Count sessions started this month (UTC) by this user."""
     now = datetime.utcnow()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     async with async_session() as sess:
         result = await sess.execute(
             select(func.count(Session.id)).where(
                 and_(
                     Session.user_id == user_id,
-                    Session.started_at >= today_start,
+                    Session.started_at >= month_start,
                 )
             )
         )
@@ -179,7 +179,7 @@ async def check_subscription_limit(telegram_id: int) -> bool:
         try:
             sub_result = await sess.execute(
                 text(
-                    "SELECT tp.max_interviews_per_day "
+                    "SELECT tp.max_interviews_per_month "
                     "FROM subscriptions s "
                     "JOIN tariff_plans tp ON s.tariff_plan_id = tp.id "
                     "WHERE s.user_id = :uid AND s.status = 'active' AND s.end_date > datetime('now') "
@@ -191,26 +191,26 @@ async def check_subscription_limit(telegram_id: int) -> bool:
             if row:
                 limit = row[0]
             else:
-                limit = 2  # free tier
+                limit = 2  # free tier — 2/month
         except Exception:
             limit = 2  # fallback
 
-        # Count today's sessions
+        # Count this month's sessions
         now = datetime.utcnow()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         count_result = await sess.execute(
             select(func.count(Session.id)).where(
                 Session.user_id == user.id,
-                Session.started_at >= today_start,
+                Session.started_at >= month_start,
             )
         )
-        today_count = count_result.scalar_one()
+        month_count = count_result.scalar_one()
 
-        return today_count < limit
+        return month_count < limit
 
 
 async def get_user_stats(telegram_id: int) -> dict:
-    """Return a stats dict for the profile command."""
+    """Return a stats dict for the profile command, including subscription info."""
     async with async_session() as sess:
         user_result = await sess.execute(
             select(User).where(User.telegram_id == telegram_id)
@@ -229,6 +229,7 @@ async def get_user_stats(telegram_id: int) -> dict:
         completed_sessions = [s for s in all_sessions if s.completed == True]  # noqa: E712
         total_all = len(all_sessions)
         total_completed = len(completed_sessions)
+        total_incomplete = total_all - total_completed
 
         avg = (
             sum(s.total_score for s in completed_sessions if s.total_score is not None) / total_completed
@@ -236,9 +237,28 @@ async def get_user_stats(telegram_id: int) -> dict:
             else 0.0
         )
 
-        role_counts: dict[str, int] = {}
-        for s in all_sessions:
-            role_counts[s.role] = role_counts.get(s.role, 0) + 1
+        # Fetch subscription info
+        plan_name = "Free"
+        max_per_day = 2
+        max_per_month = 2
+        try:
+            sub_result = await sess.execute(
+                text(
+                    "SELECT tp.name, tp.max_interviews_per_day, tp.max_interviews_per_month "
+                    "FROM subscriptions s "
+                    "JOIN tariff_plans tp ON s.tariff_plan_id = tp.id "
+                    "WHERE s.user_id = :uid AND s.status = 'active' AND s.end_date > datetime('now') "
+                    "ORDER BY s.end_date DESC LIMIT 1"
+                ),
+                {"uid": user.id},
+            )
+            row = sub_result.one_or_none()
+            if row:
+                plan_name = row[0]
+                max_per_day = row[1]
+                max_per_month = row[2]
+        except Exception:
+            pass  # fallback to Free
 
         recent = [
             {
@@ -257,10 +277,117 @@ async def get_user_stats(telegram_id: int) -> dict:
             "display_name": user.first_name or user.username or "User",
             "preferred_role": user.preferred_role,
             "total_sessions": total_all,
+            "total_completed": total_completed,
+            "total_incomplete": total_incomplete,
             "avg_score": avg,
+            "plan_name": plan_name,
+            "max_per_day": max_per_day,
+            "max_per_month": max_per_month,
             "recent_sessions": recent,
-            "role_breakdown": role_counts,
         }
+
+
+async def save_feedback(
+    telegram_id: int,
+    username: str | None,
+    message: str,
+) -> None:
+    """Persist a user feedback message to the shared SQLite."""
+    from db.models import Feedback as FeedbackModel
+
+    async with async_session() as sess:
+        fb = FeedbackModel(
+            telegram_id=telegram_id,
+            username=username,
+            message=message,
+        )
+        sess.add(fb)
+        await sess.commit()
+
+
+async def get_tariff_plans() -> list[dict]:
+    """Return all active tariff plans from the shared SQLite."""
+    async with async_session() as sess:
+        result = await sess.execute(
+            text(
+                "SELECT id, name, price, max_interviews_per_month, features, stripe_price_id, star_price "
+                "FROM tariff_plans WHERE is_active = 1 ORDER BY id"
+            )
+        )
+        rows = result.all()
+        return [
+            {
+                "id": r[0],
+                "name": r[1],
+                "price": float(r[2]),
+                "max_per_month": r[3],
+                "features": r[4],
+                "stripe_price_id": r[5],
+                "star_price": r[6] or 0,
+            }
+            for r in rows
+        ]
+
+
+async def activate_subscription(
+    telegram_id: int,
+    tariff_plan_id: int,
+    payment_type: str = "stars",
+) -> None:
+    """Create or extend a subscription after successful payment."""
+    from datetime import datetime, timedelta
+
+    async with async_session() as sess:
+        # Get user
+        user_result = await sess.execute(
+            text("SELECT id FROM users WHERE telegram_id = :tid"),
+            {"tid": telegram_id},
+        )
+        user = user_result.one_or_none()
+        if not user:
+            return
+        user_id = user[0]
+
+        # Check for existing active subscription to same plan — just extend
+        existing = await sess.execute(
+            text(
+                "SELECT id, end_date FROM subscriptions "
+                "WHERE user_id = :uid AND status = 'active' AND end_date > datetime('now') "
+                "ORDER BY end_date DESC LIMIT 1"
+            ),
+            {"uid": user_id},
+        )
+        row = existing.one_or_none()
+        if row:
+            # Extend by 30 days from current end_date
+            from datetime import datetime as dt
+            current_end = dt.fromisoformat(row[1]) if isinstance(row[1], str) else row[1]
+            new_end = current_end + timedelta(days=30)
+            await sess.execute(
+                text(
+                    "UPDATE subscriptions SET end_date = :end, payment_type = :pt "
+                    "WHERE id = :sid"
+                ),
+                {"end": new_end.isoformat(), "pt": payment_type, "sid": row[0]},
+            )
+        else:
+            # New subscription
+            start = datetime.utcnow()
+            end = start + timedelta(days=30)
+            await sess.execute(
+                text(
+                    "INSERT INTO subscriptions (user_id, tariff_plan_id, start_date, end_date, status, payment_type) "
+                    "VALUES (:uid, :tpid, :start, :end, 'active', :pt)"
+                ),
+                {
+                    "uid": user_id,
+                    "tpid": tariff_plan_id,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "pt": payment_type,
+                },
+            )
+        await sess.commit()
 
 
 async def create_auth_token(telegram_id: int) -> str:
