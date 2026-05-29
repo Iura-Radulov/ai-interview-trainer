@@ -8,3 +8,10 @@ class InterviewState(IntEnum):
     SELECTING_ROLE = 0
     SELECTING_LEVEL = 1
     IN_INTERVIEW = 2
+
+
+class ResumeState(IntEnum):
+    """States for the resume upload and analysis flow."""
+
+    WAITING_PDF = 3
+    CONFIRMING = 4

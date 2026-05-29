@@ -66,10 +66,10 @@ async def update_user_role(telegram_id: int, role: str) -> None:
             await sess.commit()
 
 
-async def create_session(user_id: int, role: str, level: str) -> int:
+async def create_session(user_id: int, role: str, level: str, company_id: Optional[str] = None, mode: str = "technical") -> int:
     """Insert a new interview session and return its primary key."""
     async with async_session() as sess:
-        new_session = Session(user_id=user_id, role=role, experience_level=level)
+        new_session = Session(user_id=user_id, role=role, experience_level=level, company_id=company_id, mode=mode)
         sess.add(new_session)
         await sess.commit()
         await sess.refresh(new_session)
@@ -183,7 +183,7 @@ async def check_subscription_limit(telegram_id: int) -> bool:
                     "FROM subscriptions s "
                     "JOIN tariff_plans tp ON s.tariff_plan_id = tp.id "
                     "WHERE s.user_id = :uid AND s.status = 'active' AND s.end_date > datetime('now') "
-                    "ORDER BY s.end_date DESC LIMIT 1"
+                    "ORDER BY s.created_at DESC LIMIT 1"
                 ),
                 {"uid": user.id},
             )
@@ -207,6 +207,38 @@ async def check_subscription_limit(telegram_id: int) -> bool:
         month_count = count_result.scalar_one()
 
         return month_count < limit
+
+
+PAID_PLANS = frozenset({"Pro", "Premium"})
+
+
+async def get_user_plan_name(telegram_id: int) -> str:
+    """Return the user's active plan name ('Free', 'Pro', 'Premium') or 'Free' if none."""
+    async with async_session() as sess:
+        user_result = await sess.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        user = user_result.scalar_one_or_none()
+        if not user:
+            return "Free"
+
+        try:
+            sub_result = await sess.execute(
+                text(
+                    "SELECT tp.name "
+                    "FROM subscriptions s "
+                    "JOIN tariff_plans tp ON s.tariff_plan_id = tp.id "
+                    "WHERE s.user_id = :uid AND s.status = 'active' AND s.end_date > datetime('now') "
+                    "ORDER BY s.created_at DESC LIMIT 1"
+                ),
+                {"uid": user.id},
+            )
+            row = sub_result.one_or_none()
+            if row:
+                return row[0]
+        except Exception:
+            pass
+        return "Free"
 
 
 async def get_user_stats(telegram_id: int) -> dict:
@@ -241,14 +273,15 @@ async def get_user_stats(telegram_id: int) -> dict:
         plan_name = "Free"
         max_per_day = 2
         max_per_month = 2
+        payment_type = None
         try:
             sub_result = await sess.execute(
                 text(
-                    "SELECT tp.name, tp.max_interviews_per_day, tp.max_interviews_per_month "
+                    "SELECT tp.name, tp.max_interviews_per_day, tp.max_interviews_per_month, s.payment_type "
                     "FROM subscriptions s "
                     "JOIN tariff_plans tp ON s.tariff_plan_id = tp.id "
                     "WHERE s.user_id = :uid AND s.status = 'active' AND s.end_date > datetime('now') "
-                    "ORDER BY s.end_date DESC LIMIT 1"
+                    "ORDER BY s.created_at DESC LIMIT 1"
                 ),
                 {"uid": user.id},
             )
@@ -257,6 +290,7 @@ async def get_user_stats(telegram_id: int) -> dict:
                 plan_name = row[0]
                 max_per_day = row[1]
                 max_per_month = row[2]
+                payment_type = row[3]
         except Exception:
             pass  # fallback to Free
 
@@ -283,6 +317,7 @@ async def get_user_stats(telegram_id: int) -> dict:
             "plan_name": plan_name,
             "max_per_day": max_per_day,
             "max_per_month": max_per_month,
+            "payment_type": payment_type,
             "recent_sessions": recent,
         }
 
@@ -310,7 +345,7 @@ async def get_tariff_plans() -> list[dict]:
     async with async_session() as sess:
         result = await sess.execute(
             text(
-                "SELECT id, name, price, max_interviews_per_month, features, stripe_price_id, star_price "
+                "SELECT id, name, price, max_interviews_per_month, features, stripe_price_id, star_price, features_ru "
                 "FROM tariff_plans WHERE is_active = 1 ORDER BY id"
             )
         )
@@ -324,9 +359,89 @@ async def get_tariff_plans() -> list[dict]:
                 "features": r[4],
                 "stripe_price_id": r[5],
                 "star_price": r[6] or 0,
+                "features_ru": r[7],
             }
             for r in rows
         ]
+
+
+async def get_interview_roles(telegram_id: Optional[int] = None) -> list[dict]:
+    """Return interview roles from DB. If telegram_id is provided, filter by plan."""
+    async with async_session() as sess:
+        result = await sess.execute(
+            text("SELECT id, name_en, name_ru, emoji, is_primary, is_free FROM interview_roles WHERE is_active = 1 ORDER BY id")
+        )
+        rows = result.all()
+
+        # Determine if user has paid plan
+        is_paid = False
+        if telegram_id:
+            sub_result = await sess.execute(
+                text(
+                    "SELECT tp.name FROM subscriptions s "
+                    "JOIN tariff_plans tp ON s.tariff_plan_id = tp.id "
+                    "WHERE s.user_id = (SELECT id FROM users WHERE telegram_id = :tid) "
+                    "AND s.status = 'active' AND s.end_date > datetime('now') "
+                    "ORDER BY s.created_at DESC LIMIT 1"
+                ),
+                {"tid": telegram_id},
+            )
+            row = sub_result.one_or_none()
+            is_paid = row and row[0] in ("Pro", "Premium")
+
+        return [
+            {
+                "id": r[0],
+                "name_en": r[1],
+                "name_ru": r[2],
+                "emoji": r[3] or "",
+                "is_primary": bool(r[4]),
+                "is_free": bool(r[5]),
+                "available": is_paid or bool(r[5]),
+            }
+            for r in rows
+        ]
+
+
+async def get_companies(telegram_id: Optional[int] = None) -> list[dict]:
+    """Return available company sets. If telegram_id is provided, filter by plan."""
+    is_paid = False
+    if telegram_id:
+        async with async_session() as sess:
+            sub_result = await sess.execute(
+                text(
+                    "SELECT tp.name FROM subscriptions s "
+                    "JOIN tariff_plans tp ON s.tariff_plan_id = tp.id "
+                    "WHERE s.user_id = (SELECT id FROM users WHERE telegram_id = :tid) "
+                    "AND s.status = 'active' AND s.end_date > datetime('now') "
+                    "ORDER BY s.created_at DESC LIMIT 1"
+                ),
+                {"tid": telegram_id},
+            )
+            row = sub_result.one_or_none()
+            is_paid = row and row[0] in ("Pro", "Premium")
+
+    async with async_session() as sess:
+        result = await sess.execute(
+            text(
+                "SELECT slug, name_en, name_ru, emoji, is_free, sort_order "
+                "FROM company_sets WHERE is_active = 1 ORDER BY sort_order"
+            )
+        )
+        rows = result.fetchall()
+
+    companies = []
+    for r in rows:
+        available = is_paid or bool(r[4])
+        companies.append({
+            "id": r[0],
+            "name_en": r[1],
+            "name_ru": r[2],
+            "emoji": r[3] or "",
+            "is_free": bool(r[4]),
+            "available": available,
+        })
+    return companies
 
 
 async def activate_subscription(
@@ -408,3 +523,57 @@ async def create_auth_token(telegram_id: int) -> str:
         )
         await sess.commit()
     return token
+
+
+# ── User settings ─────────────────────────────────────────────────────────────
+
+
+async def get_user_settings(telegram_id: int) -> dict:
+    """Return preferred_language, preferred_voice and preferred_ui_language for a user."""
+    async with async_session() as sess:
+        result = await sess.execute(
+            text(
+                "SELECT preferred_language, preferred_voice, preferred_ui_language "
+                "FROM users WHERE telegram_id = :tid"
+            ),
+            {"tid": telegram_id},
+        )
+        row = result.one_or_none()
+        if row:
+            return {
+                "language": row[0] or "en",
+                "voice": row[1] or "alloy",
+                "ui_language": row[2] or "en",
+            }
+        return {"language": "en", "voice": "alloy", "ui_language": "en"}
+
+
+async def update_user_settings(
+    telegram_id: int,
+    language: Optional[str] = None,
+    voice: Optional[str] = None,
+    ui_language: Optional[str] = None,
+) -> dict:
+    """Update preferred_language, preferred_voice, and/or preferred_ui_language for a user."""
+    sets = {}
+    if language is not None:
+        sets["preferred_language"] = language
+    if voice is not None:
+        sets["preferred_voice"] = voice
+    if ui_language is not None:
+        sets["preferred_ui_language"] = ui_language
+
+    if not sets:
+        return await get_user_settings(telegram_id)
+
+    set_clause = ", ".join(f"{k} = :{k}" for k in sets)
+    sets["tid"] = telegram_id
+
+    async with async_session() as sess:
+        await sess.execute(
+            text(f"UPDATE users SET {set_clause} WHERE telegram_id = :tid"),
+            sets,
+        )
+        await sess.commit()
+
+    return await get_user_settings(telegram_id)

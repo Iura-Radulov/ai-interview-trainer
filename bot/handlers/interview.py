@@ -1,5 +1,7 @@
-"""Full interview ConversationHandler: role → level → 5 questions → summary."""
+"""Full interview ConversationHandler: role -> level -> 5 questions -> summary."""
+import io
 import logging
+import time
 
 from telegram import Update
 from telegram.ext import (
@@ -14,6 +16,7 @@ from telegram.ext import (
 import config
 from ai import interviewer as ai
 from ai.scoring import format_evaluation_message, format_summary_message
+from ai.voice import text_to_speech, transcribe_audio
 from bot.keyboards import level_keyboard, role_keyboard
 from bot.states import InterviewState
 from db.database import (
@@ -23,6 +26,7 @@ from db.database import (
     create_session,
     get_or_create_user,
     get_session_answers,
+    get_user_plan_name,
     save_answer,
 )
 
@@ -33,7 +37,7 @@ SELECTING_LEVEL = InterviewState.SELECTING_LEVEL
 IN_INTERVIEW = InterviewState.IN_INTERVIEW
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# --- entry point ---------------------------------------------------------------
 
 async def start_interview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Begin the interview flow: register user and enforce monthly rate limit."""
@@ -50,11 +54,11 @@ async def start_interview(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Check monthly subscription limit
     if not await check_subscription_limit(user.id):
         await update.message.reply_text(
-            f"⚠️ You've reached the monthly limit of "
-            f"*{config.MAX_FREE_INTERVIEWS_PER_MONTH} interviews*\\.\n\n"
-            "Upgrade your plan with /plan to get unlimited access\\! 🚀\n"
-            "Review your progress with /profile\\.",
-            parse_mode="MarkdownV2",
+            f"Warning: You've reached the monthly limit of "
+            f"*{config.MAX_FREE_INTERVIEWS_PER_MONTH} interviews*.\n\n"
+            "Upgrade your plan with /plan to get unlimited access! 🚀\n"
+            "Review your progress with /profile.",
+            parse_mode="Markdown",
         )
         return ConversationHandler.END
 
@@ -67,15 +71,15 @@ async def start_interview(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(
         f"🎯 *Start New Interview*\n\n"
         f"Interviews this month: *{month_count}* "
-        f"({remaining} remaining)\\.\n\n"
+        f"({remaining} remaining).\n\n"
         "Select your role:",
-        parse_mode="MarkdownV2",
+        parse_mode="Markdown",
         reply_markup=role_keyboard(),
     )
     return SELECTING_ROLE
 
 
-# ── state: SELECTING_ROLE ─────────────────────────────────────────────────────
+# --- state: SELECTING_ROLE -------------------------------------------------------
 
 async def select_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Store the chosen role and ask for experience level."""
@@ -85,7 +89,7 @@ async def select_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     role = query.data.removeprefix("role_") if query.data else ""
     if role not in config.ROLES:
         await query.edit_message_text(
-            "Invalid role — please pick again\\.", parse_mode="MarkdownV2",
+            "Invalid role -- please pick again.", parse_mode="MarkdownV2",
             reply_markup=role_keyboard(),
         )
         return SELECTING_ROLE
@@ -101,7 +105,7 @@ async def select_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return SELECTING_LEVEL
 
 
-# ── state: SELECTING_LEVEL ────────────────────────────────────────────────────
+# --- state: SELECTING_LEVEL ------------------------------------------------------
 
 async def select_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Create the DB session, generate question 1, and move into IN_INTERVIEW."""
@@ -111,7 +115,7 @@ async def select_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     level = query.data.removeprefix("level_") if query.data else ""
     if level not in config.EXPERIENCE_LEVELS:
         await query.edit_message_text(
-            "Invalid level — please pick again\\.", parse_mode="MarkdownV2",
+            "Invalid level -- please pick again.", parse_mode="MarkdownV2",
             reply_markup=level_keyboard(),
         )
         return SELECTING_LEVEL
@@ -130,7 +134,7 @@ async def select_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     level_emoji = config.LEVEL_EMOJIS.get(level, "")
 
     await query.edit_message_text(
-        f"🚀 *Interview Starting\\!*\n\n"
+        f"🚀 *Interview Starting\!*\n\n"
         f"Role: {role_emoji} *{role}*\n"
         f"Level: {level_emoji} *{level}*\n"
         f"Questions: *{config.QUESTIONS_PER_SESSION}*\n\n"
@@ -143,14 +147,12 @@ async def select_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     context.user_data["question_number"] = 1
     context.user_data["previous_questions"] = [question["question"]]
 
-    await query.message.reply_text(
-        _question_text(question, 1, config.QUESTIONS_PER_SESSION),
-        parse_mode="Markdown",
-    )
+    await _send_question_with_voice(query.message, question, 1, config.QUESTIONS_PER_SESSION)
+    context.user_data["question_sent_at"] = time.time()
     return IN_INTERVIEW
 
 
-# ── state: IN_INTERVIEW ───────────────────────────────────────────────────────
+# --- state: IN_INTERVIEW ---------------------------------------------------------
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Evaluate the user's answer, persist it, then ask the next question or end."""
@@ -163,10 +165,14 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     if not (role and level and question and session_id):
         await update.message.reply_text(
-            "Session error — please start a new interview with /interview\\.",
+            "Session error -- please start a new interview with /interview.",
             parse_mode="MarkdownV2",
         )
         return ConversationHandler.END
+
+    # Calculate time taken
+    sent_at = context.user_data.get("question_sent_at")
+    time_taken = int(time.time() - sent_at) if sent_at else None
 
     thinking = await update.message.reply_text("🤔 Evaluating your answer…")
 
@@ -175,6 +181,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         level=level,
         question=question["question"],
         answer=user_answer,
+        time_taken_seconds=time_taken,
     )
 
     await save_answer(
@@ -220,14 +227,136 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.user_data["question_number"] = next_num
     context.user_data["previous_questions"] = previous_questions + [next_q["question"]]
 
-    await update.message.reply_text(
-        _question_text(next_q, next_num, config.QUESTIONS_PER_SESSION),
-        parse_mode="Markdown",
-    )
+    await _send_question_with_voice(update.message, next_q, next_num, config.QUESTIONS_PER_SESSION)
+    context.user_data["question_sent_at"] = time.time()
     return IN_INTERVIEW
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# --- voice answer handler --------------------------------------------------------
+
+
+async def handle_voice_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Transcribe a voice message and evaluate it as a text answer."""
+    voice = update.message.voice
+    if not voice:
+        await update.message.reply_text("Please send a voice message.")
+        return IN_INTERVIEW
+
+    # Check subscription -- voice is a Pro+ feature
+    user = update.effective_user
+    if user:
+        plan = await get_user_plan_name(user.id)
+        if plan not in ("Pro", "Premium"):
+            await update.message.reply_text(
+                "🎤 Voice-based interviews are available on *Pro* and above.\n"
+                "Upgrade with /plan to unlock voice mode.",
+                parse_mode="Markdown",
+            )
+            return IN_INTERVIEW
+
+    thinking_msg = await update.message.reply_text("🎤 Transcribing your voice answer…")
+
+    try:
+        # Download the voice file from Telegram
+        voice_file = await voice.get_file()
+        audio_bytes = await voice_file.download_as_bytearray()
+
+        # Transcribe via Whisper
+        transcribed = await transcribe_audio(bytes(audio_bytes))
+
+        if not transcribed:
+            await thinking_msg.edit_text(
+                "❌ Could not transcribe your voice message. "
+                "Please try speaking clearly or type your answer instead.",
+            )
+            return IN_INTERVIEW
+
+        await thinking_msg.edit_text(
+            f"📝 *Transcribed:*\n\u201c{transcribed[:300]}{'…' if len(transcribed) > 300 else ''}\u201d\n\n🤔 Evaluating…",
+            parse_mode="Markdown",
+        )
+
+    except Exception as exc:
+        logger.error("Voice processing error: %s", exc)
+        await thinking_msg.edit_text(
+            "❌ Voice processing failed. Please try sending your answer as text.",
+        )
+        return IN_INTERVIEW
+
+    # Calculate time taken
+    sent_at = context.user_data.get("question_sent_at")
+    time_taken = int(time.time() - sent_at) if sent_at else None
+
+    # Now evaluate the transcribed text (same flow as handle_answer)
+    role: str = context.user_data.get("role", "")
+    level: str = context.user_data.get("level", "")
+    question: dict = context.user_data.get("current_question", {})
+    question_number: int = context.user_data.get("question_number", 1)
+    session_id: int = context.user_data.get("session_id", 0)
+
+    if not (role and level and question and session_id):
+        await update.message.reply_text(
+            "Session error -- please start a new interview with /interview.",
+        )
+        return ConversationHandler.END
+
+    evaluation = await ai.evaluate_answer(
+        role=role,
+        level=level,
+        question=question["question"],
+        answer=transcribed,
+        time_taken_seconds=time_taken,
+    )
+
+    await save_answer(
+        session_id=session_id,
+        question_number=question_number,
+        question_text=question["question"],
+        user_answer=transcribed,
+        score=evaluation["score"],
+        feedback=evaluation["feedback"],
+        strengths=evaluation["strengths"],
+        improvements=evaluation["improvements"],
+        tip=evaluation["tip"],
+        category=question.get("category", "Technical"),
+    )
+
+    try:
+        await thinking_msg.delete()
+    except Exception:
+        pass
+
+    await update.message.reply_text(
+        format_evaluation_message(
+            question_number=question_number,
+            total_questions=config.QUESTIONS_PER_SESSION,
+            score=evaluation["score"],
+            feedback=evaluation["feedback"],
+            strengths=evaluation["strengths"],
+            improvements=evaluation["improvements"],
+            tip=evaluation["tip"],
+        ),
+        parse_mode="Markdown",
+    )
+
+    if question_number >= config.QUESTIONS_PER_SESSION:
+        return await _finish_interview(update, context, session_id, role, level)
+
+    # Generate next question
+    previous_questions: list[str] = context.user_data.get("previous_questions", [])
+    next_num = question_number + 1
+    next_q = await ai.generate_question(role, level, next_num, previous_questions)
+
+    context.user_data["current_question"] = next_q
+    context.user_data["question_number"] = next_num
+    context.user_data["previous_questions"] = previous_questions + [next_q["question"]]
+
+    await _send_question_with_voice(update.message, next_q, next_num, config.QUESTIONS_PER_SESSION)
+    context.user_data["question_sent_at"] = time.time()
+    return IN_INTERVIEW
+
+
+# --- helpers ---------------------------------------------------------------------
 
 def _question_text(question: dict, number: int, total: int) -> str:
     """Format a question for display."""
@@ -237,6 +366,25 @@ def _question_text(question: dict, number: int, total: int) -> str:
         f"📝 *Question {number}/{total}*  [{category}]  •  {difficulty}\n\n"
         f"{question['question']}"
     )
+
+
+async def _send_question_with_voice(
+    target,
+    question: dict,
+    number: int,
+    total: int,
+) -> None:
+    """Send question as text + voice message (TTS)."""
+    text = _question_text(question, number, total)
+    await target.reply_text(text, parse_mode="Markdown")
+
+    # Try TTS -- best-effort, never block on failure
+    try:
+        audio_bytes = await text_to_speech(question["question"])
+        if audio_bytes:
+            await target.reply_voice(voice=io.BytesIO(audio_bytes))
+    except Exception:
+        pass
 
 
 async def _finish_interview(
@@ -283,13 +431,13 @@ async def cancel_interview(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Cancel an in-progress interview."""
     context.user_data.clear()
     await update.message.reply_text(
-        "❌ Interview cancelled\\. Use /interview to start a new one\\.",
+        "❌ Interview cancelled\. Use /interview to start a new one\.",
         parse_mode="MarkdownV2",
     )
     return ConversationHandler.END
 
 
-# ── builder ───────────────────────────────────────────────────────────────────
+# --- builder ---------------------------------------------------------------------
 
 def build_interview_handler() -> ConversationHandler:
     """Return a fully configured ConversationHandler for the interview flow."""
@@ -304,6 +452,7 @@ def build_interview_handler() -> ConversationHandler:
             ],
             IN_INTERVIEW: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_answer),
+                MessageHandler(filters.VOICE, handle_voice_answer),
             ],
         },
         fallbacks=[

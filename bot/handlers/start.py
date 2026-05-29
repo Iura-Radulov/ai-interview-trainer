@@ -56,6 +56,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "⚙️ *Backend* — APIs, databases, system design\n"
         "🔄 *Fullstack* — end-to-end development\n"
         "🤖 *ML* — machine learning, deep learning\n\n"
+        "📄 /resume — Upload your resume for auto-analysis\n\n"
         "Select your primary role to get started:"
     )
 
@@ -105,6 +106,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "*Commands:*\n"
         "/start — register and set your preferred role\n"
         "/interview — start a new interview session\n"
+        "/resume — upload your resume for auto-analysis\n"
         "/profile — view your stats and history\n"
         "/plan — view pricing and subscribe\n"
         "/feedback — send feedback to the developers\n"

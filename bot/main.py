@@ -23,6 +23,7 @@ from bot.handlers.payments import (
 )
 from bot.handlers.plan import plan_command
 from bot.handlers.profile import profile_command
+from bot.handlers.resume import build_resume_handler
 from bot.handlers.start import help_command, set_role_callback, start_command
 from db.database import init_db
 
@@ -45,6 +46,7 @@ async def _post_init(application: Application) -> None:
     commands = [
         BotCommand("start", "Register and choose your role"),
         BotCommand("interview", "Start a new interview session"),
+        BotCommand("resume", "Upload your resume and start an AI-tailored interview"),
         BotCommand("profile", "View your stats and history"),
         BotCommand("plan", "View pricing and subscribe"),
         BotCommand("pay", "Buy subscription with Telegram Stars"),
@@ -97,6 +99,7 @@ def create_application() -> Application:
     app.add_handler(CallbackQueryHandler(stars_callback, pattern=r"^stars_"))
 
     # ── conversation handlers ─────────────────────────────────────────────────
+    app.add_handler(build_resume_handler())
     app.add_handler(build_interview_handler())
     app.add_handler(build_feedback_handler())
 

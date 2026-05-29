@@ -26,6 +26,9 @@ async def generate_question(
     level: str,
     question_number: int,
     previous_questions: list[str],
+    language: str = "en",
+    company_context: str = "",
+    mode: str = "technical",
 ) -> dict:
     """Generate one interview question via GPT-4o.
 
@@ -34,12 +37,15 @@ async def generate_question(
         level: Experience level (Junior / Mid / Senior).
         question_number: Position in the session (1-5).
         previous_questions: Already-asked question texts to avoid repetition.
+        language: Output language code ("en" or "ru").
+        company_context: AI context prompt for company-specific interviews (e.g. Google, Amazon).
+        mode: "technical" for tech interviews, "behavioral" for pure STAR/behavioral sessions.
 
     Returns:
         Dict with keys: question, category, expected_topics, difficulty.
     """
     client = _get_client()
-    system_prompt = get_question_prompt(role, level, question_number, previous_questions)
+    system_prompt = get_question_prompt(role, level, question_number, previous_questions, language=language, company_context=company_context, mode=mode)
     try:
         response = await client.chat.completions.create(
             model=config.OPENAI_MODEL,
@@ -63,7 +69,7 @@ async def generate_question(
         return _fallback_question(role, question_number)
 
 
-async def evaluate_answer(role: str, level: str, question: str, answer: str) -> dict:
+async def evaluate_answer(role: str, level: str, question: str, answer: str, language: str = "en", time_taken_seconds: int | None = None, mode: str = "technical") -> dict:
     """Evaluate a candidate's answer via GPT-4o.
 
     Args:
@@ -71,12 +77,16 @@ async def evaluate_answer(role: str, level: str, question: str, answer: str) -> 
         level: Experience level.
         question: The interview question that was asked.
         answer: The candidate's textual answer.
+        language: Output language code ("en" or "ru").
+        time_taken_seconds: Optional time spent answering (for Premium timing analysis).
+        mode: "technical" for tech interviews, "behavioral" for behavioral/STAR sessions.
 
     Returns:
-        Dict with keys: score, feedback, strengths, improvements, tip.
+        Dict with keys: score, feedback, strengths, improvements, tip, timing_analysis,
+        and for behavioral mode also: star_analysis.
     """
     client = _get_client()
-    system_prompt = get_evaluation_prompt(role, level, question, answer)
+    system_prompt = get_evaluation_prompt(role, level, question, answer, language=language, time_taken_seconds=time_taken_seconds, mode=mode)
     try:
         response = await client.chat.completions.create(
             model=config.OPENAI_MODEL,
@@ -89,20 +99,24 @@ async def evaluate_answer(role: str, level: str, question: str, answer: str) -> 
             max_tokens=600,
         )
         data = json.loads(response.choices[0].message.content)
-        return {
+        result = {
             "score": max(1, min(10, int(data.get("score", 5)))),
             "feedback": data.get("feedback", "Thank you for your answer."),
             "strengths": data.get("strengths", []),
             "improvements": data.get("improvements", []),
             "tip": data.get("tip", ""),
+            "timing_analysis": data.get("timing_analysis"),
         }
+        if mode == "behavioral" and "star_analysis" in data:
+            result["star_analysis"] = data["star_analysis"]
+        return result
     except Exception as exc:
         logger.error("evaluate_answer failed: %s", exc)
         return _fallback_evaluation()
 
 
 async def generate_summary(
-    role: str, level: str, answers: list[dict], avg_score: float
+    role: str, level: str, answers: list[dict], avg_score: float, language: str = "en", mode: str = "technical"
 ) -> dict:
     """Generate a post-session summary via GPT-4o.
 
@@ -111,13 +125,16 @@ async def generate_summary(
         level: Experience level.
         answers: List of answer dicts from the completed session.
         avg_score: Pre-computed mean score.
+        language: Output language code ("en" or "ru").
+        mode: "technical" for tech interviews, "behavioral" for behavioral/STAR sessions.
 
     Returns:
         Dict with keys: overall_assessment, key_strengths, key_improvements,
         topics_to_study, overall_rating.
+        For behavioral mode also: star_breakdown, competency_scores.
     """
     client = _get_client()
-    system_prompt = get_summary_prompt(role, level, answers, avg_score)
+    system_prompt = get_summary_prompt(role, level, answers, avg_score, language=language, mode=mode)
     try:
         response = await client.chat.completions.create(
             model=config.OPENAI_MODEL,
@@ -130,13 +147,19 @@ async def generate_summary(
             max_tokens=800,
         )
         data = json.loads(response.choices[0].message.content)
-        return {
+        result = {
             "overall_assessment": data.get("overall_assessment", ""),
             "key_strengths": data.get("key_strengths", []),
             "key_improvements": data.get("key_improvements", []),
             "topics_to_study": data.get("topics_to_study", []),
             "overall_rating": data.get("overall_rating", "Needs Improvement"),
         }
+        if mode == "behavioral":
+            if "star_breakdown" in data:
+                result["star_breakdown"] = data["star_breakdown"]
+            if "competency_scores" in data:
+                result["competency_scores"] = data["competency_scores"]
+        return result
     except Exception as exc:
         logger.error("generate_summary failed: %s", exc)
         return _fallback_summary(avg_score)

@@ -31,6 +31,9 @@ class User(Base):
     username = Column(String(255), nullable=True)
     first_name = Column(String(255), nullable=True)
     preferred_role = Column(String(50), nullable=True)
+    preferred_language = Column(String(10), nullable=True, default="en")
+    preferred_voice = Column(String(20), nullable=True, default="alloy")
+    preferred_ui_language = Column(String(10), nullable=True, default="en")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     sessions = relationship("Session", back_populates="user", lazy="select")
@@ -45,6 +48,8 @@ class Session(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     role = Column(String(50), nullable=False)
     experience_level = Column(String(50), nullable=False)
+    mode = Column(String(20), nullable=False, server_default="technical")  # "technical" or "behavioral"
+    company_id = Column(String(50), nullable=True)  # company set key (general, google, amazon, etc.)
     started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     completed_at = Column(DateTime, nullable=True)
     total_score = Column(Float, nullable=True)
