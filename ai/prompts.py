@@ -21,9 +21,14 @@ _ROLE_CONTEXT: dict[str, str] = {
         "Focus areas: Both frontend (React, TypeScript) and backend (APIs, databases), "
         "full-stack architecture, deployment, DevOps basics."
     ),
-    "ML": (
-        "Focus areas: Machine learning algorithms, deep learning, Python (NumPy, Pandas, "
-        "PyTorch/TensorFlow), model evaluation, feature engineering, MLOps, statistics."
+    "System Design": (
+        "Focus areas: Designing scalable and reliable systems, "
+        "high-level architecture, component design (load balancers, databases, caches, "
+        "message queues, CDN), data flow and storage, trade-off analysis (consistency vs "
+        "availability, read vs write optimization), API design, microservices vs monoliths, "
+        "distributed systems fundamentals (CAP theorem, consensus protocols, sharding, "
+        "replication), performance optimization, fault tolerance, disaster recovery. "
+        "Questions are real-world: design YouTube, Twitter, URL shortener, Uber, chat system, etc."
     ),
 }
 
@@ -38,9 +43,9 @@ Previously asked questions (avoid repeating the same topic):
 Role context: {role_context}
 
 {company_context}
-
+{skills_context}
 Rules:
-- Mix question types across the session: Technical (60 %), Behavioral (20 %), System Design (20 %)
+- {mix_rule}
 - Difficulty must suit {level} level
 - The question must be clear and unambiguous
 - {language_instruction}
@@ -62,7 +67,7 @@ Previously asked questions (avoid repeating the same topic):
 {previous_questions}
 
 {company_context}
-
+{skills_context}
 Interview method: STAR (Situation, Task, Action, Result)
 
 Rules:
@@ -203,6 +208,55 @@ Respond with ONLY valid JSON:
   }}
 }}"""
 
+_SD_EVALUATION_SYSTEM = """\
+You are an expert system design interviewer evaluating a candidate's architecture answer.
+
+Role: {role} at {level} level
+Question: {question}
+Candidate answer: {answer}
+
+Evaluate on system design quality:
+
+Scoring guide:
+9-10 Exceptional — clear architecture, well-reasoned trade-offs, covers all key components (DB, cache, API layer, load balancers, CDN), explicitly addresses scalability, fault tolerance, and data flow
+7-8  Good — solid high-level design, most components covered, some trade-offs discussed, moderate depth
+5-6  Adequate — basic design present, missing key components, few or no trade-offs discussed
+3-4  Weak — vague architecture, missing critical components, no trade-off analysis
+1-2  Very poor — no coherent design or fundamentally wrong approach for the problem
+
+{language_instruction}
+
+Respond with ONLY valid JSON:
+{{
+  "score": <integer 1-10>,
+  "feedback": "<2-3 sentence overall assessment of the architecture quality>",
+  "strengths": ["<architectural strength>", "..."],
+  "improvements": ["<missing component or weak area>", "..."],
+  "tip": "<one specific actionable tip to improve system design answers>"
+}}"""
+
+_SD_SUMMARY_SYSTEM = """\
+You are an expert system design interview coach providing a post-session debrief.
+
+Role: {role} at {level} level
+Average score: {avg_score:.1f}/10
+
+Session Q&A:
+{qa_summary}
+
+{language_instruction}
+
+Analyze the candidate's system design thinking across all answers. Focus on architecture maturity, trade-off reasoning, scalability mindset, and component depth.
+
+Respond with ONLY valid JSON:
+{{
+  "overall_assessment": "<2-3 sentence assessment focused on system design growth areas>",
+  "key_strengths": ["<architectural strength>", "<strength>", "<strength>"],
+  "key_improvements": ["<design area to improve>", "<area>", "<area>"],
+  "topics_to_study": ["<system design topic>", "<topic>", "<topic>", "<topic>"],
+  "overall_rating": "<Excellent | Good | Needs Improvement | Significant Work Required>"
+}}"""
+
 
 def get_question_prompt(
     role: str,
@@ -212,10 +266,17 @@ def get_question_prompt(
     language: str = "en",
     company_context: str = "",
     mode: str = "technical",
+    skills: str = "",
 ) -> str:
     """Return a filled system prompt for question generation."""
     prev = "\n".join(f"- {q}" for q in previous_questions) if previous_questions else "None"
     lang_inst = _LANGUAGE_MAP.get(language, _LANGUAGE_MAP["en"])
+    skills_context = (
+        f"Candidate's specified skills: {skills}\n"
+        f"Focus questions on these skills where possible.\n"
+        if skills
+        else ""
+    )
 
     if mode == "behavioral":
         return _BEHAVIORAL_QUESTION_SYSTEM.format(
@@ -224,8 +285,18 @@ def get_question_prompt(
             question_number=question_number,
             previous_questions=prev,
             company_context=company_context,
+            skills_context=skills_context,
             language_instruction=lang_inst,
         )
+
+    if mode == "system_design" or role == "System Design":
+        mix_rule = (
+            "ALL questions must be system design questions — design a scalable distributed system "
+            "(e.g., a URL shortener, Twitter, YouTube, chat service, Uber, etc.). "
+            "Each question should focus on architecture, trade-offs, scalability, and component design."
+        )
+    else:
+        mix_rule = "Mix question types across the session: Technical (60 %), Behavioral (20 %), System Design (20 %)"
 
     return _QUESTION_SYSTEM.format(
         role=role,
@@ -237,6 +308,8 @@ def get_question_prompt(
             f"Role: {role}. Generate relevant interview questions based on this role's typical responsibilities, required skills, tools, and domain knowledge at {level} level. Adapt the question content to match this specific role.",
         ),
         company_context=company_context,
+        skills_context=skills_context,
+        mix_rule=mix_rule,
         language_instruction=lang_inst,
     )
 
@@ -255,6 +328,15 @@ def get_evaluation_prompt(
 
     if mode == "behavioral":
         return _BEHAVIORAL_EVALUATION_SYSTEM.format(
+            role=role,
+            level=level,
+            question=question,
+            answer=answer,
+            language_instruction=lang_inst,
+        )
+
+    if mode == "system_design" or role == "System Design":
+        return _SD_EVALUATION_SYSTEM.format(
             role=role,
             level=level,
             question=question,
@@ -308,6 +390,15 @@ def get_summary_prompt(
 
     if mode == "behavioral":
         return _BEHAVIORAL_SUMMARY_SYSTEM.format(
+            role=role,
+            level=level,
+            avg_score=avg_score,
+            qa_summary=qa_summary,
+            language_instruction=lang_inst,
+        )
+
+    if mode == "system_design" or role == "System Design":
+        return _SD_SUMMARY_SYSTEM.format(
             role=role,
             level=level,
             avg_score=avg_score,

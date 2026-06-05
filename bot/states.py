@@ -15,3 +15,15 @@ class ResumeState(IntEnum):
 
     WAITING_PDF = 3
     CONFIRMING = 4
+
+
+class CompanyState(IntEnum):
+    """States for the company interview flow."""
+
+    SHOWING_COMPANIES = 5
+    ADDING_NAME = 6
+    ADDING_URL = 7
+    ADDING_POSITION = 8
+    SELECTING_ROLE = 9
+    SELECTING_LEVEL = 10
+    IN_INTERVIEW = 2  # reuse interview state

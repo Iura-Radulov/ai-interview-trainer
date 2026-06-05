@@ -259,13 +259,14 @@ async def get_user_stats(telegram_id: int) -> dict:
         all_sessions = all_sessions_result.scalars().all()
 
         completed_sessions = [s for s in all_sessions if s.completed == True]  # noqa: E712
+        sessions_with_scores = [s for s in completed_sessions if s.total_score is not None]
         total_all = len(all_sessions)
         total_completed = len(completed_sessions)
         total_incomplete = total_all - total_completed
 
         avg = (
-            sum(s.total_score for s in completed_sessions if s.total_score is not None) / total_completed
-            if total_completed > 0
+            sum(s.total_score for s in sessions_with_scores) / len(sessions_with_scores)
+            if len(sessions_with_scores) > 0
             else 0.0
         )
 
@@ -294,17 +295,33 @@ async def get_user_stats(telegram_id: int) -> dict:
         except Exception:
             pass  # fallback to Free
 
-        recent = [
-            {
-                "id": s.id,
-                "role": s.role,
-                "experience_level": s.experience_level,
-                "total_score": s.total_score,
-                "started_at": s.started_at.isoformat() if s.started_at else "",
-                "completed": s.completed,
-            }
-            for s in all_sessions[:10]
-        ]
+        # For completed sessions with NULL total_score, compute from answers
+        async def _score_for(session_id: int) -> float | None:
+            result = await sess.execute(
+                text("SELECT ROUND(AVG(score), 1) FROM answers WHERE session_id = :sid"),
+                {"sid": session_id},
+            )
+            return result.scalar_one()
+
+        recent = []
+        for s in all_sessions[:10]:
+            score = s.total_score
+            if score is None and s.completed:
+                try:
+                    score = await _score_for(s.id)
+                except Exception:
+                    pass  # keep None
+            recent.append(
+                {
+                    "id": s.id,
+                    "role": s.role,
+                    "experience_level": s.experience_level,
+                    "mode": getattr(s, 'mode', 'technical'),
+                    "total_score": score,
+                    "started_at": s.started_at.isoformat() if s.started_at else "",
+                    "completed": s.completed,
+                }
+            )
 
         return {
             "user_id": user.id,
@@ -505,6 +522,27 @@ async def activate_subscription(
         await sess.commit()
 
 
+async def create_auth_code(telegram_id: int) -> str:
+    """Generate a 6-digit numeric auth code, save to DB, return the code."""
+    import secrets
+    from datetime import datetime, timedelta
+
+    # Generate a 6-digit code
+    code = ''.join(str(secrets.randbelow(10)) for _ in range(6))
+    expires_at = (datetime.utcnow() + timedelta(minutes=5)).isoformat()
+
+    async with async_session() as sess:
+        await sess.execute(
+            text(
+                "INSERT INTO auth_tokens (telegram_id, token, expires_at) "
+                "VALUES (:tid, :tok, :exp)"
+            ),
+            {"tid": telegram_id, "tok": code, "exp": expires_at},
+        )
+        await sess.commit()
+    return code
+
+
 async def create_auth_token(telegram_id: int) -> str:
     """Generate a one-time auth token for web login, save to DB, return the token."""
     import secrets
@@ -577,3 +615,76 @@ async def update_user_settings(
         await sess.commit()
 
     return await get_user_settings(telegram_id)
+
+
+async def get_user_companies(telegram_id: int) -> list[dict]:
+    """Return user's custom companies for a given Telegram user."""
+    async with async_session() as sess:
+        result = await sess.execute(
+            text(
+                "SELECT id, company_name, vacancy_url, position, ai_context, created_at "
+                "FROM user_companies WHERE user_id = (SELECT id FROM users WHERE telegram_id = :tid) "
+                "ORDER BY created_at DESC"
+            ),
+            {"tid": telegram_id},
+        )
+        rows = result.fetchall()
+        return [
+            {
+                "id": r[0],
+                "company_name": r[1],
+                "vacancy_url": r[2] or "",
+                "position": r[3] or "",
+                "ai_context": r[4] or "",
+                "created_at": r[5] or "",
+            }
+            for r in rows
+        ]
+
+
+async def create_user_company(
+    telegram_id: int,
+    company_name: str,
+    vacancy_url: str = "",
+    position: str = "",
+) -> dict:
+    """Create a new user company entry and trigger AI context generation."""
+    async with async_session() as sess:
+        user_result = await sess.execute(
+            text("SELECT id FROM users WHERE telegram_id = :tid"),
+            {"tid": telegram_id},
+        )
+        user = user_result.one_or_none()
+        if not user:
+            raise ValueError("User not found")
+
+        result = await sess.execute(
+            text(
+                "INSERT INTO user_companies (user_id, company_name, vacancy_url, position, ai_context, created_at) "
+                "VALUES (:uid, :name, :url, :pos, '', datetime('now'))"
+            ),
+            {"uid": user[0], "name": company_name, "url": vacancy_url, "pos": position},
+        )
+        await sess.commit()
+
+        company_id = result.lastrowid
+        return {
+            "id": company_id,
+            "company_name": company_name,
+            "vacancy_url": vacancy_url,
+            "position": position,
+            "ai_context": "",
+        }
+
+
+async def delete_user_company(company_id: int, telegram_id: int) -> bool:
+    """Delete a user company entry if it belongs to the given user."""
+    async with async_session() as sess:
+        result = await sess.execute(
+            text(
+                "DELETE FROM user_companies WHERE id = :cid AND user_id = (SELECT id FROM users WHERE telegram_id = :tid)"
+            ),
+            {"cid": company_id, "tid": telegram_id},
+        )
+        await sess.commit()
+        return result.rowcount > 0

@@ -33,6 +33,11 @@ from db.database import (
 logger = logging.getLogger(__name__)
 
 SELECTING_ROLE = InterviewState.SELECTING_ROLE
+
+
+def _get_mode(role: str) -> str:
+    """Return the AI mode string for a given interview role."""
+    return "system_design" if role == "System Design" else "technical"
 SELECTING_LEVEL = InterviewState.SELECTING_LEVEL
 IN_INTERVIEW = InterviewState.IN_INTERVIEW
 
@@ -142,7 +147,7 @@ async def select_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         parse_mode="MarkdownV2",
     )
 
-    question = await ai.generate_question(role, level, 1, [])
+    question = await ai.generate_question(role, level, 1, [], mode=_get_mode(role))
     context.user_data["current_question"] = question
     context.user_data["question_number"] = 1
     context.user_data["previous_questions"] = [question["question"]]
@@ -182,6 +187,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         question=question["question"],
         answer=user_answer,
         time_taken_seconds=time_taken,
+        mode=_get_mode(role),
     )
 
     await save_answer(
@@ -221,7 +227,7 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # Generate next question
     previous_questions: list[str] = context.user_data.get("previous_questions", [])
     next_num = question_number + 1
-    next_q = await ai.generate_question(role, level, next_num, previous_questions)
+    next_q = await ai.generate_question(role, level, next_num, previous_questions, mode=_get_mode(role))
 
     context.user_data["current_question"] = next_q
     context.user_data["question_number"] = next_num
@@ -306,6 +312,7 @@ async def handle_voice_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
         question=question["question"],
         answer=transcribed,
         time_taken_seconds=time_taken,
+        mode=_get_mode(role),
     )
 
     await save_answer(
@@ -345,7 +352,7 @@ async def handle_voice_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Generate next question
     previous_questions: list[str] = context.user_data.get("previous_questions", [])
     next_num = question_number + 1
-    next_q = await ai.generate_question(role, level, next_num, previous_questions)
+    next_q = await ai.generate_question(role, level, next_num, previous_questions, mode=_get_mode(role))
 
     context.user_data["current_question"] = next_q
     context.user_data["question_number"] = next_num
@@ -400,7 +407,7 @@ async def _finish_interview(
     answers = await get_session_answers(session_id)
     avg_score = sum(a["score"] for a in answers) / len(answers) if answers else 0.0
 
-    summary = await ai.generate_summary(role, level, answers, avg_score)
+    summary = await ai.generate_summary(role, level, answers, avg_score, mode=_get_mode(role))
     await complete_session(session_id, avg_score)
 
     try:

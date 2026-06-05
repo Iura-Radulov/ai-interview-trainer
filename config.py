@@ -7,6 +7,7 @@ load_dotenv()
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENAI_MODEL_PREMIUM: str = os.getenv("OPENAI_MODEL_PREMIUM", "gpt-5.4")
 DATABASE_PATH: str = os.getenv("DATABASE_PATH", "./data/interviews.db")
 MINI_APP_URL: str = os.getenv("MINI_APP_URL", "https://mini.techinterviewai.com")
 FEEDBACK_CHAT_ID: str = os.getenv("FEEDBACK_CHAT_ID", "")
@@ -16,14 +17,14 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 QUESTIONS_PER_SESSION: int = 5
 SESSION_TIMEOUT_MINUTES: int = 30
 
-ROLES: list[str] = ["Frontend", "Backend", "Fullstack", "ML"]
+ROLES: list[str] = ["Frontend", "Backend", "Fullstack", "System Design"]
 EXPERIENCE_LEVELS: list[str] = ["Junior", "Mid", "Senior"]
 
 ROLE_EMOJIS: dict[str, str] = {
     "Frontend": "🎨",
     "Backend": "⚙️",
     "Fullstack": "🔄",
-    "ML": "🤖",
+    "System Design": "🏗️",
 }
 
 LEVEL_EMOJIS: dict[str, str] = {

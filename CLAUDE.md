@@ -14,7 +14,7 @@ Telegram bot for AI-powered IT interview practice. Target: global market (Englis
 Build a fully functional Telegram bot with:
 
 ### Commands
-- `/start` — Welcome message, choose role (Frontend/Backend/Fullstack/ML)
+- `/start` — Welcome message, choose role (Frontend/Backend/Fullstack/System Design)
 - `/interview` — Start a new interview session
 - `/profile` — View stats (interviews completed, average score, progress)
 - `/help` — Usage instructions
@@ -36,7 +36,7 @@ Build a fully functional Telegram bot with:
 - **Frontend**: React, Next.js, CSS, JS/TS fundamentals, web perf
 - **Backend**: APIs, databases, auth, system design basics, Laravel
 - **Fullstack**: Combined frontend + backend questions
-- **System Design**: Architecture, scaling, trade-offs
+- **System Design**: Designing scalable systems, high-level architecture, trade-off analysis, distributed systems, real-world problems (design YouTube, Twitter, Uber, etc.)
 - **Behavioral**: STAR method, leadership, conflict resolution
 
 ### Key Features

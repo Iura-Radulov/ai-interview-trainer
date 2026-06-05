@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes
 
 import config
 from bot.keyboards import start_role_keyboard
-from db.database import create_auth_token, get_or_create_user, update_user_role
+from db.database import create_auth_code, get_or_create_user, update_user_role
 
 logger = logging.getLogger(__name__)
 
@@ -32,15 +32,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.info("start_command called, args=%s, user=%s", args, user.id if user else None)
     if args and args[0] == "auth":
         try:
-            token = await create_auth_token(user.id)
-            magic_link = f"https://techinterviewai.com/api/auth/callback?token={token}"
+            code = await create_auth_code(user.id)
             text = (
-                f"🔐 Login link generated!\n\n"
-                f"Click the link below to sign in to your dashboard:\n"
-                f"{magic_link}\n\n"
-                f"⚠️ This link expires in 5 minutes and can only be used once."
+                f'🔐 <b>Your login code:</b> <code>{code}</code>\n\n'
+                f'Enter this code on the login page at '
+                f'<a href="https://techinterviewai.com/auth/login">techinterviewai.com</a>\n\n'
+                f'⚠️ Code expires in 5 minutes and can only be used once.'
             )
-            await update.message.reply_text(text, parse_mode=None, disable_web_page_preview=True)
+            await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
         except Exception as exc:
             logger.error("Failed to create auth token: %s", exc)
             await update.message.reply_text(
@@ -52,10 +51,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     text = (
         f"👋 Welcome to *AI Interview Trainer*, {user.first_name or 'there'}!\n\n"
         "I'm your personal AI interview coach. Practice for:\n"
-        "🎨 *Frontend* — React, Next.js, TypeScript\n"
+        "🎨 *Frontend* — React, Next.js, web performance\n"
         "⚙️ *Backend* — APIs, databases, system design\n"
-        "🔄 *Fullstack* — end-to-end development\n"
-        "🤖 *ML* — machine learning, deep learning\n\n"
+        "🔄 *Fullstack* — frontend + backend\n"
+        "🏗️ *System Design* — architecture, scalability, trade-offs\n\n"
         "📄 /resume — Upload your resume for auto-analysis\n\n"
         "Select your primary role to get started:"
     )
@@ -106,7 +105,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "*Commands:*\n"
         "/start — register and set your preferred role\n"
         "/interview — start a new interview session\n"
-        "/resume — upload your resume for auto-analysis\n"
+        "/resume — upload your resume for auto\-analysis\n"
+        "/company — company link interview \\(Premium\\)\n"
         "/profile — view your stats and history\n"
         "/plan — view pricing and subscribe\n"
         "/feedback — send feedback to the developers\n"

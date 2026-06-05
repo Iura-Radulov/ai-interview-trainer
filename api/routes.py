@@ -1,18 +1,22 @@
 """All API route handlers for the Mini App backend."""
 import hashlib
+import json
 import logging
+from datetime import datetime
 from typing import Optional
 
 import os
 import tempfile
 
 import fitz
-from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
+from fastapi.responses import Response
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 import config
 from ai.interviewer import evaluate_answer, generate_question, generate_summary
+from ai.resume_deep_analyzer import analyze_resume_deep
 from api.auth import validate_init_data
 from db.database import (
     async_session,
@@ -31,6 +35,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+# ── Helper: resolve model by plan ──────────────────────────────────────────────
+
+def _resolve_model(plan_name: str) -> str:
+    """Return 'gpt-5.4' for Premium users, otherwise the default model."""
+    return config.OPENAI_MODEL_PREMIUM if plan_name == "Premium" else config.OPENAI_MODEL
+
+
 # ── Pydantic request models ───────────────────────────────────────────────────
 
 
@@ -41,7 +52,9 @@ class AuthRequest(BaseModel):
 class StartInterviewRequest(BaseModel):
     role: str
     level: str
+    skills: Optional[str] = None
     company_id: Optional[str] = None
+    user_company_id: Optional[int] = None
     mode: str = "technical"  # "technical" or "behavioral"
 
 
@@ -178,6 +191,23 @@ async def auth(request: AuthRequest) -> dict:
         return {"ok": False, "error": "Database error"}
 
 
+@router.post("/auth/create-token")
+async def create_auth_token_endpoint(
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Generate a one-time auth token for seamless web login."""
+    telegram_id = user_data.get("id")
+    if not telegram_id or telegram_id == 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        from db.database import create_auth_token as _create_token
+        token = await _create_token(telegram_id)
+        return {"ok": True, "token": token}
+    except Exception as exc:
+        logger.error("create_auth_token error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to create token")
+
+
 @router.post("/interview/start")
 async def start_interview(
     request: StartInterviewRequest,
@@ -196,18 +226,35 @@ async def start_interview(
                 detail="Monthly interview limit reached. Upgrade to Pro for unlimited access.",
             )
 
-        session_id = await create_session(db_user_id, request.role, request.level, request.company_id, request.mode)
+        effective_mode = "system_design" if request.role == "System Design" else request.mode
+        session_id = await create_session(db_user_id, request.role, request.level, request.company_id, effective_mode)
 
-        # Fetch user's language preference
+        # Fetch user's language preference and plan
         from db.database import get_user_settings
         settings = await get_user_settings(telegram_id)
         language = settings.get("language", "en")
+        plan_name = await get_user_plan_name(telegram_id)
+        model = _resolve_model(plan_name)
 
         # Get company context if specified
         company_context = ""
         if request.company_id:
             from api.companies import get_company_context
             company_context = get_company_context(request.company_id)
+        elif request.user_company_id:
+            # Look up user's custom company
+            from db.database import async_session
+            async with async_session() as sess:
+                result = await sess.execute(
+                    text(
+                        "SELECT company_name, position, ai_context FROM user_companies "
+                        "WHERE id = :ucid AND user_id = (SELECT id FROM users WHERE telegram_id = :tid)"
+                    ),
+                    {"ucid": request.user_company_id, "tid": telegram_id},
+                )
+                row = result.one_or_none()
+            if row:
+                company_context = row[2] or ""  # ai_context
 
         question = await generate_question(
             role=request.role,
@@ -216,14 +263,20 @@ async def start_interview(
             previous_questions=[],
             language=language,
             company_context=company_context,
-            mode=request.mode,
+            mode=effective_mode,
+            skills=request.skills or "",
+            model=model,
         )
+
+        logger.info("start_interview uid=%s plan=%s model=%s q=%s",
+                     telegram_id, plan_name, model,
+                     str(question.get("question", ""))[:100] if question.get("question") else "EMPTY!")
 
         return {
             "session_id": session_id,
             "question": question,
             "question_number": 1,
-            "mode": request.mode,
+            "mode": effective_mode,
         }
     except HTTPException:
         raise
@@ -252,6 +305,8 @@ async def submit_answer(
         from db.database import get_user_settings
         settings = await get_user_settings(telegram_id)
         language = settings.get("language", "en")
+        plan_name = await get_user_plan_name(telegram_id)
+        model = _resolve_model(plan_name)
 
         evaluation = await evaluate_answer(
             role=session.role,
@@ -261,6 +316,7 @@ async def submit_answer(
             language=language,
             time_taken_seconds=request.time_taken_seconds,
             mode=getattr(session, 'mode', 'technical'),
+            model=model,
         )
 
         # Persist the evaluated answer
@@ -297,6 +353,7 @@ async def submit_answer(
                 language=language,
                 company_context=company_context,
                 mode=getattr(session, 'mode', 'technical'),
+                model=model,
             )
 
             return {
@@ -319,6 +376,7 @@ async def submit_answer(
                 avg_score=avg_score,
                 language=language,
                 mode=getattr(session, 'mode', 'technical'),
+                model=model,
             )
 
             return {
@@ -337,9 +395,9 @@ async def submit_answer(
 @router.post("/interview/voice-answer")
 async def voice_answer(
     file: UploadFile = File(...),
-    session_id: int = ...,  # noqa — FastAPI handles via form
-    question_text: str = ...,
-    time_taken_seconds: Optional[int] = None,
+    session_id: int = Form(...),
+    question_text: str = Form(...),
+    time_taken_seconds: Optional[int] = Form(None),
     user_data: dict = Depends(get_current_user),
 ) -> dict:
     """Accept a voice answer, transcribe via Whisper, evaluate via AI, return result.
@@ -421,6 +479,9 @@ async def voice_answer(
         )
 
         # ── Next question or summary ─────────────────────────────────────────────
+        plan_name = await get_user_plan_name(telegram_id)
+        model = _resolve_model(plan_name)
+
         if question_number < config.QUESTIONS_PER_SESSION:
             all_answers = await get_session_answers(session_id)
             previous_questions = [a["question_text"] for a in all_answers]
@@ -436,8 +497,10 @@ async def voice_answer(
                 level=session.experience_level,
                 question_number=question_number + 1,
                 previous_questions=previous_questions,
+                language=language,
                 company_context=company_context,
                 mode=getattr(session, 'mode', 'technical'),
+                model=model,
             )
 
             return {
@@ -460,6 +523,7 @@ async def voice_answer(
             avg_score=avg_score,
             language=language,
             mode=getattr(session, 'mode', 'technical'),
+            model=model,
         )
 
         return {
@@ -562,11 +626,13 @@ async def get_next_question(
             question_number=next_num,
             previous_questions=[a["question_text"] for a in existing_answers],
             language=language,
+            mode=getattr(session, 'mode', 'technical'),
         )
 
         return {
             "question": question,
             "question_number": next_num,
+            "mode": getattr(session, 'mode', 'technical'),
         }
     except HTTPException:
         raise
@@ -590,7 +656,54 @@ async def get_profile(user_data: dict = Depends(get_current_user)) -> dict:
                 "plan_name": "Free",
                 "max_per_month": 2,
                 "recent_sessions": [],
+                "features": [],
+                "features_ru": [],
             }
+
+        # Fetch tariff features
+        features: list[str] = []
+        features_ru: list[str] | None = None
+        try:
+            async with async_session() as sess:
+                from sqlalchemy import text as sa_text
+                plan_result = await sess.execute(
+                    sa_text(
+                        "SELECT tp.features, tp.features_ru FROM subscriptions s "
+                        "JOIN tariff_plans tp ON s.tariff_plan_id = tp.id "
+                        "WHERE s.user_id = (SELECT id FROM users WHERE telegram_id = :tid) "
+                        "AND s.status = 'active' AND s.end_date > datetime('now') "
+                        "ORDER BY s.created_at DESC LIMIT 1"
+                    ),
+                    {"tid": telegram_id},
+                )
+                row = plan_result.one_or_none()
+                if row:
+                    raw = row[0]
+                    if raw:
+                        try:
+                            parsed = json.loads(raw) if isinstance(raw, str) else raw
+                            if isinstance(parsed, list):
+                                features = parsed
+                            elif isinstance(parsed, str):
+                                features = [f.strip() for f in parsed.split(",") if f.strip()]
+                            else:
+                                features = []
+                        except (json.JSONDecodeError, TypeError):
+                            features = [f.strip() for f in str(raw).split(",") if raw] if raw else []
+                    raw_ru = row[1]
+                    if raw_ru:
+                        try:
+                            parsed = json.loads(raw_ru) if isinstance(raw_ru, str) else raw_ru
+                            if isinstance(parsed, list):
+                                features_ru = parsed
+                            elif isinstance(parsed, str):
+                                features_ru = [f.strip() for f in parsed.split(",") if f.strip()]
+                            else:
+                                features_ru = []
+                        except (json.JSONDecodeError, TypeError):
+                            features_ru = [f.strip() for f in str(raw_ru).split(",") if raw_ru] if raw_ru else []
+        except Exception:
+            pass  # fallback to empty features
 
         return {
             "total_sessions": stats["total_sessions"],
@@ -599,6 +712,8 @@ async def get_profile(user_data: dict = Depends(get_current_user)) -> dict:
             "plan_name": stats["plan_name"],
             "max_per_month": stats["max_per_month"],
             "recent_sessions": stats["recent_sessions"],
+            "features": features,
+            "features_ru": features_ru or [],
         }
 
     except HTTPException:
@@ -606,6 +721,371 @@ async def get_profile(user_data: dict = Depends(get_current_user)) -> dict:
     except Exception as exc:
         logger.error("get_profile error: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to get profile")
+
+
+# ── User Resumes ──────────────────────────────────────────────────────────────
+
+_RESUMES_DIR = os.path.join(os.path.dirname(config.DATABASE_PATH), "resumes")
+
+
+@router.get("/user-resumes")
+async def list_user_resumes(
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Return the current user's saved resume analyses."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    async with async_session() as sess:
+        result = await sess.execute(
+            text(
+                "SELECT id, original_filename, role, experience_level, "
+                "company_name, analysis_result, created_at "
+                "FROM user_resumes WHERE user_id = :uid ORDER BY created_at DESC"
+            ),
+            {"uid": db_user_id},
+        )
+        rows = result.fetchall()
+
+    resumes = []
+    for r in rows:
+        analysis = json.loads(r[5]) if r[5] else {}
+        resumes.append({
+            "id": r[0],
+            "original_filename": r[1],
+            "role": r[2],
+            "experience_level": r[3],
+            "company_name": r[4] or "",
+            "overall_score": analysis.get("overall_score"),
+            "ats_score": analysis.get("ats_score"),
+            "created_at": r[6],
+        })
+    return {"resumes": resumes}
+
+
+@router.get("/user-resumes/usage")
+async def get_resume_usage(
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Return resume analysis usage stats for the current user."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    plan_name = await get_user_plan_name(telegram_id)
+    MONTHLY_LIMITS = {"Free": 2, "Pro": 999999, "Premium": 999999}
+    max_monthly = MONTHLY_LIMITS.get(plan_name, 2)
+
+    async with async_session() as sess:
+        count_row = await sess.execute(
+            text(
+                "SELECT COUNT(*) FROM user_resumes "
+                "WHERE user_id = :uid "
+                "AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')"
+            ),
+            {"uid": db_user_id},
+        )
+        used = count_row.scalar() or 0
+
+    return {
+        "plan_name": plan_name,
+        "used_this_month": used,
+        "max_monthly": max_monthly,
+        "remaining": max(0, max_monthly - used),
+        "unlimited": max_monthly >= 999999,
+    }
+
+
+@router.post("/user-resumes/upload")
+async def upload_user_resume(
+    file: UploadFile = File(...),
+    target_role: str = Form(...),
+    experience_level: str = Form(...),
+    company_context: str = Form(""),
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Upload a PDF resume, analyze it with deep AI, and store the result."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    # ── Limit check: Free = 2/month, Pro/Premium = unlimited ──
+    plan_name = await get_user_plan_name(telegram_id)
+    MONTHLY_LIMITS = {"Free": 2, "Pro": 999999, "Premium": 999999}
+    max_monthly = MONTHLY_LIMITS.get(plan_name, 2)
+
+    async with async_session() as count_sess:
+        count_row = await count_sess.execute(
+            text(
+                "SELECT COUNT(*) FROM user_resumes "
+                "WHERE user_id = :uid "
+                "AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')"
+            ),
+            {"uid": db_user_id},
+        )
+        used_this_month = count_row.scalar() or 0
+
+    logger.info(
+        "Resume upload check: user=%s plan=%s used=%d max=%d",
+        telegram_id, plan_name, used_this_month, max_monthly,
+    )
+
+    if used_this_month >= max_monthly:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Resume analysis limit reached for {plan_name} plan ({max_monthly}/month)",
+        )
+
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+
+    # Read and extract text
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    tmp_path = os.path.join(tempfile.gettempdir(), f"resume_upload_{telegram_id}.pdf")
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+
+        pdf_doc = fitz.open(tmp_path)
+        pdf_text = "\n".join(page.get_text() for page in pdf_doc)
+        pdf_doc.close()
+
+        if not pdf_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract text from this PDF. It may be a scanned/image-only document.",
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("PDF extraction failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to extract PDF text")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+    # Deep analysis
+    analysis = await analyze_resume_deep(
+        pdf_text=pdf_text,
+        target_role=target_role,
+        experience_level=experience_level,
+        company_context=company_context,
+    )
+
+    # Save PDF file to persistent storage
+    os.makedirs(_RESUMES_DIR, exist_ok=True)
+    safe_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{telegram_id}_{file.filename}"
+    file_path = os.path.join(_RESUMES_DIR, safe_name)
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    fixed_content = analysis.get("fixed_content", "")
+
+    async with async_session() as sess:
+        result = await sess.execute(
+            text(
+                "INSERT INTO user_resumes "
+                "(user_id, original_filename, file_path, role, experience_level, "
+                "company_name, analysis_result, fixed_content, created_at) "
+                "VALUES (:uid, :fname, :fpath, :role, :level, :ctx, :analysis, :fixed, :now) "
+                "RETURNING id, created_at"
+            ),
+            {
+                "uid": db_user_id,
+                "fname": file.filename,
+                "fpath": file_path,
+                "role": target_role,
+                "level": experience_level,
+                "ctx": company_context,
+                "analysis": json.dumps(analysis),
+                "fixed": fixed_content,
+                "now": datetime.utcnow().isoformat(),
+            },
+        )
+        await sess.commit()
+        row = result.fetchone()
+
+    return {
+        "id": row[0],
+        "original_filename": file.filename,
+        "role": target_role,
+        "experience_level": experience_level,
+        "analysis": analysis,
+        "created_at": row[1],
+    }
+
+
+@router.delete("/user-resumes/{resume_id}")
+async def delete_user_resume(
+    resume_id: int,
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Delete a saved resume analysis and its file."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    async with async_session() as sess:
+        # Fetch and verify ownership
+        row = await sess.execute(
+            text(
+                "SELECT id, file_path FROM user_resumes "
+                "WHERE id = :rid AND user_id = :uid"
+            ),
+            {"rid": resume_id, "uid": db_user_id},
+        )
+        resume = row.fetchone()
+        if not resume:
+            raise HTTPException(status_code=404, detail="Resume not found or not owned")
+
+        # Remove file if exists
+        file_path = resume[1]
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception as exc:
+                logger.warning("Failed to remove resume file %s: %s", file_path, exc)
+
+        await sess.execute(
+            text("DELETE FROM user_resumes WHERE id = :rid AND user_id = :uid"),
+            {"rid": resume_id, "uid": db_user_id},
+        )
+        await sess.commit()
+
+    return {"ok": True}
+
+
+@router.get("/user-resumes/{resume_id}/download-pdf")
+async def download_user_resume_pdf(
+    resume_id: int,
+    user_data: dict = Depends(get_current_user),
+) -> Response:
+    """Return the improved resume as a PDF file, generated from fixed_content."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    async with async_session() as sess:
+        row = await sess.execute(
+            text(
+                "SELECT original_filename, fixed_content, role, experience_level "
+                "FROM user_resumes WHERE id = :rid AND user_id = :uid"
+            ),
+            {"rid": resume_id, "uid": db_user_id},
+        )
+        resume = row.fetchone()
+        if not resume:
+            raise HTTPException(status_code=404, detail="Resume not found or not owned")
+
+    original_filename = resume[0] or "resume"
+    fixed_content = resume[1] or ""
+    role = resume[2] or ""
+    level = resume[3] or ""
+
+    # Generate PDF from fixed content using fpdf2
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.add_font("DV", "", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    pdf.add_font("DV", "B", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+    pdf.set_font("DV", "B", 18)
+    pdf.cell(0, 12, "Improved Resume", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(4)
+
+    pdf.set_font("DV", "", 9)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 6, f"Role: {role}  |  Level: {level}", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(6)
+
+    pdf.set_draw_color(41, 128, 185)
+    pdf.set_line_width(0.5)
+    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+    pdf.ln(6)
+
+    pdf.set_text_color(30, 30, 30)
+    pdf.set_font("DV", "", 10)
+    for line in fixed_content.split("\n"):
+        s = line.strip()
+        if s:
+            pdf.set_x(pdf.l_margin)
+            # Bold for section headers (ALL CAPS or ending with :)
+            if s.isupper() and len(s) < 60:
+                pdf.set_font("DV", "B", 11)
+                pdf.multi_cell(0, 6, s)
+                pdf.set_font("DV", "", 10)
+            elif s.endswith(":") and len(s) < 50:
+                pdf.set_font("DV", "B", 10)
+                pdf.multi_cell(0, 6, s)
+                pdf.set_font("DV", "", 10)
+            else:
+                pdf.multi_cell(0, 6, s)
+        else:
+            pdf.ln(3)
+
+    basename = original_filename.replace(".pdf", "").replace(".PDF", "")
+    safe_name = f"{basename}_improved.pdf"
+
+    import io
+    buf = io.BytesIO()
+    pdf.output(buf)
+    buf.seek(0)
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )
+
+
+@router.get("/user-resumes/{resume_id}/download")
+async def download_user_resume(
+    resume_id: int,
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Return the analysis result including the rewritten fixed_content."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    async with async_session() as sess:
+        row = await sess.execute(
+            text(
+                "SELECT id, original_filename, role, experience_level, "
+                "company_name, analysis_result, fixed_content, created_at "
+                "FROM user_resumes WHERE id = :rid AND user_id = :uid"
+            ),
+            {"rid": resume_id, "uid": db_user_id},
+        )
+        resume = row.fetchone()
+        if not resume:
+            raise HTTPException(status_code=404, detail="Resume not found or not owned")
+
+    analysis = json.loads(resume[5]) if resume[5] else {}
+
+    return {
+        "id": resume[0],
+        "original_filename": resume[1],
+        "role": resume[2],
+        "experience_level": resume[3],
+        "company_name": resume[4] or "",
+        "analysis": analysis,
+        "fixed_content": resume[6] or "",
+        "created_at": resume[7],
+    }
 
 
 # ── Resume analysis ───────────────────────────────────────────────────────────
@@ -895,7 +1375,7 @@ async def update_settings(
                     "JOIN tariff_plans tp ON s.tariff_plan_id = tp.id "
                     "WHERE s.user_id = (SELECT id FROM users WHERE telegram_id = :tid) "
                     "AND s.status = 'active' AND s.end_date > datetime('now') "
-                    "ORDER BY s.end_date DESC LIMIT 1"
+                    "ORDER BY s.created_at DESC LIMIT 1"
                 ),
                 {"tid": telegram_id},
             )
@@ -968,3 +1448,199 @@ async def create_stars_invoice(
 
     invoice_link = data["result"]
     return {"invoice_url": invoice_link, "star_price": star_price, "plan": plan_name}
+
+
+# ── User Companies ─────────────────────────────────────────────────────────
+
+
+class CreateUserCompanyRequest(BaseModel):
+    telegram_id: int
+    company_name: str
+    vacancy_url: str
+    position: str
+
+
+class DeleteUserCompanyRequest(BaseModel):
+    telegram_id: int
+    company_id: int
+
+
+@router.get("/user-companies")
+async def list_user_companies(user_data: dict = Depends(get_current_user)) -> dict:
+    """Return user's custom companies."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+    async with async_session() as sess:
+        result = await sess.execute(
+            text(
+                "SELECT id, company_name, vacancy_url, position, ai_context, created_at "
+                "FROM user_companies WHERE user_id = :uid ORDER BY created_at DESC"
+            ),
+            {"uid": db_user_id},
+        )
+        rows = result.fetchall()
+    companies = [
+        {
+            "id": r[0],
+            "company_name": r[1],
+            "vacancy_url": r[2] or "",
+            "position": r[3] or "",
+            "ai_context": r[4] or "",
+            "created_at": r[5],
+        }
+        for r in rows
+    ]
+    return {"companies": companies}
+
+
+@router.post("/user-companies/create")
+async def create_user_company(request: CreateUserCompanyRequest) -> dict:
+    """Create a new user company with AI-generated context from vacancy URL."""
+    telegram_id = request.telegram_id
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    if not request.company_name.strip():
+        raise HTTPException(status_code=400, detail="Company name is required")
+    if not request.position.strip():
+        raise HTTPException(status_code=400, detail="Position is required")
+    if not request.vacancy_url.strip():
+        raise HTTPException(status_code=400, detail="Vacancy URL is required")
+
+    # Generate AI context from vacancy URL + position
+    ai_context = await _generate_company_context(
+        company_name=request.company_name,
+        vacancy_url=request.vacancy_url,
+        position=request.position,
+    )
+
+    async with async_session() as sess:
+        result = await sess.execute(
+            text(
+                "INSERT INTO user_companies (user_id, company_name, vacancy_url, position, ai_context) "
+                "VALUES (:uid, :name, :url, :pos, :ctx) RETURNING id, created_at"
+            ),
+            {
+                "uid": db_user_id,
+                "name": request.company_name,
+                "url": request.vacancy_url,
+                "pos": request.position,
+                "ctx": ai_context,
+            },
+        )
+        await sess.commit()
+        row = result.fetchone()
+
+    return {
+        "id": row[0],
+        "company_name": request.company_name,
+        "vacancy_url": request.vacancy_url,
+        "position": request.position,
+        "ai_context": ai_context,
+        "created_at": row[1],
+    }
+
+
+@router.delete("/user-companies/{company_id}")
+async def delete_user_company(
+    company_id: int,
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Delete a user's custom company."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    async with async_session() as sess:
+        # Verify ownership
+        row = await sess.execute(
+            text("SELECT id FROM user_companies WHERE id = :cid AND user_id = :uid"),
+            {"cid": company_id, "uid": db_user_id},
+        )
+        if not row.fetchone():
+            raise HTTPException(status_code=404, detail="Company not found or not owned")
+
+        await sess.execute(
+            text("DELETE FROM user_companies WHERE id = :cid AND user_id = :uid"),
+            {"cid": company_id, "uid": db_user_id},
+        )
+        await sess.commit()
+
+    return {"ok": True}
+
+
+async def _generate_company_context(
+    company_name: str,
+    vacancy_url: str,
+    position: str,
+) -> str:
+    """Fetch vacancy page text and generate an AI context prompt using OpenAI."""
+    page_text = ""
+    if vacancy_url:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                resp = await client.get(vacancy_url, headers={"User-Agent": "Mozilla/5.0"})
+                if resp.status_code == 200:
+                    import re
+                    html = resp.text
+                    # Strip HTML tags
+                    page_text = re.sub(r"<[^>]+>", " ", html)
+                    page_text = re.sub(r"\s+", " ", page_text).strip()
+                    page_text = page_text[:3000]  # Limit text length
+        except Exception as exc:
+            logger.warning("Failed to fetch vacancy URL %s: %s", vacancy_url, exc)
+
+    # Build the prompt for OpenAI
+    parts = [f"You are preparing the candidate for an interview at {company_name}."]
+    if position:
+        parts.append(f"The target position is: {position}.")
+    if page_text:
+        parts.append(f"The vacancy description says: {page_text}")
+    parts.append(
+        "Generate a concise AI interviewer context prompt (2-3 paragraphs) "
+        "that describes the company's interview style, technical focus areas, "
+        "and key competencies to assess. Include behavioral aspects relevant to "
+        "the company culture. The context will be used by an AI interviewer "
+        "to ask tailored interview questions."
+    )
+    user_prompt = "\n\n".join(parts)
+
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+        response = await client.chat.completions.create(
+            model=config.OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert interview coach who creates tailored "
+                        "AI interviewer contexts for specific companies and roles. "
+                        "Write in English."
+                    ),
+                },
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.5,
+            max_completion_tokens=400,
+        )
+        return response.choices[0].message.content or ""
+    except Exception as exc:
+        logger.error("OpenAI context generation failed: %s", exc)
+        # Fallback basic context
+        fallback = (
+            f"You are interviewing the candidate for {company_name}."
+        )
+        if position:
+            fallback += f" The target position is: {position}."
+        fallback += (
+            " Ask relevant technical and behavioral questions appropriate for "
+            "this company and role. Assess both technical skills and cultural fit."
+        )
+        return fallback

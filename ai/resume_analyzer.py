@@ -34,7 +34,7 @@ Extract structured information and return ONLY a JSON object with these exact ke
 - raw_title: the exact job title text found in the resume (string or null)
 
 Role mapping rules:
-- For standard engineering roles (Frontend, Backend, Fullstack, ML): suggest as-is
+- For standard engineering roles (Frontend, Backend, Fullstack, System Design): suggest as-is
 - For other specializations: use the actual role title from the resume (e.g. "Graphic Designer", "DevOps Engineer", "Data Analyst", "Product Manager", "QA Engineer", "iOS Developer", "Cloud Architect", etc.)
 - Be specific — don't lump everything into "Frontend" or "Backend" if the resume clearly describes a different specialization
 
@@ -69,7 +69,7 @@ async def analyze_resume(pdf_text: str) -> dict:
                 },
             ],
             temperature=0.2,
-            max_tokens=600,
+            max_completion_tokens=600,
         )
         data = json.loads(response.choices[0].message.content)
 

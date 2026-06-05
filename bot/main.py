@@ -13,11 +13,11 @@ from telegram.ext import (
 )
 
 import config
+from bot.handlers.company import build_company_handler
 from bot.handlers.feedback import build_feedback_handler
 from bot.handlers.interview import build_interview_handler
 from bot.handlers.payments import (
     pre_checkout_handler,
-    send_stars_invoice,
     stars_callback,
     successful_payment_handler,
 )
@@ -47,9 +47,9 @@ async def _post_init(application: Application) -> None:
         BotCommand("start", "Register and choose your role"),
         BotCommand("interview", "Start a new interview session"),
         BotCommand("resume", "Upload your resume and start an AI-tailored interview"),
+        BotCommand("company", "Company Link Interview — practice for a specific company"),
         BotCommand("profile", "View your stats and history"),
         BotCommand("plan", "View pricing and subscribe"),
-        BotCommand("pay", "Buy subscription with Telegram Stars"),
         BotCommand("feedback", "Send feedback to the developers"),
         BotCommand("help", "Show help and usage info"),
     ]
@@ -86,7 +86,6 @@ def create_application() -> Application:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("plan", plan_command))
-    app.add_handler(CommandHandler("pay", send_stars_invoice))
 
     # ── Telegram Stars payments ───────────────────────────────────────────────
     app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
@@ -101,6 +100,7 @@ def create_application() -> Application:
     # ── conversation handlers ─────────────────────────────────────────────────
     app.add_handler(build_resume_handler())
     app.add_handler(build_interview_handler())
+    app.add_handler(build_company_handler())
     app.add_handler(build_feedback_handler())
 
     return app

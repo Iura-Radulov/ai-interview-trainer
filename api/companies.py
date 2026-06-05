@@ -120,6 +120,45 @@ COMPANY_SETS = {
             "Emphasize correctness, reliability, and API usability."
         ),
     },
+    "microsoft": {
+        "name_en": "Microsoft",
+        "name_ru": "Microsoft",
+        "emoji": "🪟",
+        "is_free": False,
+        "context": (
+            "You are interviewing for Microsoft. "
+            "Focus areas: system design (Azure, distributed systems), "
+            "C#/.NET/C++, algorithms and data structures, "
+            "behavioral questions using the STAR method aligned with "
+            "Microsoft's culture (growth mindset, collaboration, "
+            "customer obsession, diversity & inclusion). "
+            "Ask questions in the style of Microsoft's interview loop: "
+            "a mix of technical deep-dives, system design, and behavioral "
+            "'tell me about a time' questions. Emphasize real-world "
+            "engineering trade-offs, design discussions, and coding clarity. "
+            "For system design, focus on large-scale cloud services "
+            "and distributed computing."
+        ),
+    },
+    "apple": {
+        "name_en": "Apple",
+        "name_ru": "Apple",
+        "emoji": "🍎",
+        "is_free": False,
+        "context": (
+            "You are interviewing for Apple. "
+            "Focus areas: Swift/Objective-C/iOS/macOS for client-side roles, "
+            "C/C++ for systems and hardware-adjacent roles, "
+            "system design with emphasis on performance, privacy, and user experience, "
+            "behavioral questions driven by Apple's values "
+            "(simplicity, craftsmanship, collaboration, privacy-first). "
+            "Ask questions that reflect Apple's attention to detail "
+            "and design excellence. For behavioral questions, focus on "
+            "cross-functional collaboration, shipping high-quality products "
+            "under tight timelines, and dealing with ambiguity. "
+            "Include system design for consumer-scale services at high reliability."
+        ),
+    },
 }
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "interviews.db")

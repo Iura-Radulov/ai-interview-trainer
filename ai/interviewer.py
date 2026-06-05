@@ -29,37 +29,43 @@ async def generate_question(
     language: str = "en",
     company_context: str = "",
     mode: str = "technical",
+    skills: str = "",
+    model: Optional[str] = None,
 ) -> dict:
-    """Generate one interview question via GPT-4o.
+    """Generate one interview question via AI.
 
     Args:
-        role: Developer role (Frontend / Backend / Fullstack / ML).
+        role: Developer role (Frontend / Backend / Fullstack / System Design).
         level: Experience level (Junior / Mid / Senior).
         question_number: Position in the session (1-5).
         previous_questions: Already-asked question texts to avoid repetition.
         language: Output language code ("en" or "ru").
         company_context: AI context prompt for company-specific interviews (e.g. Google, Amazon).
         mode: "technical" for tech interviews, "behavioral" for pure STAR/behavioral sessions.
+        skills: Optional comma-separated skills to focus questions on (e.g. "React, TypeScript").
+        model: Optional model override (e.g. "gpt-5.4" for Premium). Defaults to config.OPENAI_MODEL.
 
     Returns:
         Dict with keys: question, category, expected_topics, difficulty.
     """
     client = _get_client()
-    system_prompt = get_question_prompt(role, level, question_number, previous_questions, language=language, company_context=company_context, mode=mode)
+    system_prompt = get_question_prompt(role, level, question_number, previous_questions, language=language, company_context=company_context, mode=mode, skills=skills)
     try:
         response = await client.chat.completions.create(
-            model=config.OPENAI_MODEL,
+            model=model or config.OPENAI_MODEL,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Generate question {question_number} of 5."},
             ],
             temperature=0.8,
-            max_tokens=500,
+            max_completion_tokens=500,
         )
         data = json.loads(response.choices[0].message.content)
+        q_text = data.get("question", "")
         return {
-            "question": data.get("question", ""),
+            "question": q_text,
+            "question_text": q_text,
             "category": data.get("category", "Technical"),
             "expected_topics": data.get("expected_topics", []),
             "difficulty": data.get("difficulty", "Medium"),
@@ -69,8 +75,8 @@ async def generate_question(
         return _fallback_question(role, question_number)
 
 
-async def evaluate_answer(role: str, level: str, question: str, answer: str, language: str = "en", time_taken_seconds: int | None = None, mode: str = "technical") -> dict:
-    """Evaluate a candidate's answer via GPT-4o.
+async def evaluate_answer(role: str, level: str, question: str, answer: str, language: str = "en", time_taken_seconds: int | None = None, mode: str = "technical", model: Optional[str] = None) -> dict:
+    """Evaluate a candidate's answer via AI.
 
     Args:
         role: Developer role.
@@ -80,6 +86,7 @@ async def evaluate_answer(role: str, level: str, question: str, answer: str, lan
         language: Output language code ("en" or "ru").
         time_taken_seconds: Optional time spent answering (for Premium timing analysis).
         mode: "technical" for tech interviews, "behavioral" for behavioral/STAR sessions.
+        model: Optional model override (e.g. "gpt-5.4" for Premium). Defaults to config.OPENAI_MODEL.
 
     Returns:
         Dict with keys: score, feedback, strengths, improvements, tip, timing_analysis,
@@ -89,14 +96,14 @@ async def evaluate_answer(role: str, level: str, question: str, answer: str, lan
     system_prompt = get_evaluation_prompt(role, level, question, answer, language=language, time_taken_seconds=time_taken_seconds, mode=mode)
     try:
         response = await client.chat.completions.create(
-            model=config.OPENAI_MODEL,
+            model=model or config.OPENAI_MODEL,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": answer},
             ],
             temperature=0.3,
-            max_tokens=600,
+            max_completion_tokens=600,
         )
         data = json.loads(response.choices[0].message.content)
         result = {
@@ -116,9 +123,9 @@ async def evaluate_answer(role: str, level: str, question: str, answer: str, lan
 
 
 async def generate_summary(
-    role: str, level: str, answers: list[dict], avg_score: float, language: str = "en", mode: str = "technical"
+    role: str, level: str, answers: list[dict], avg_score: float, language: str = "en", mode: str = "technical", model: Optional[str] = None
 ) -> dict:
-    """Generate a post-session summary via GPT-4o.
+    """Generate a post-session summary via AI.
 
     Args:
         role: Developer role.
@@ -127,6 +134,7 @@ async def generate_summary(
         avg_score: Pre-computed mean score.
         language: Output language code ("en" or "ru").
         mode: "technical" for tech interviews, "behavioral" for behavioral/STAR sessions.
+        model: Optional model override (e.g. "gpt-5.4" for Premium). Defaults to config.OPENAI_MODEL.
 
     Returns:
         Dict with keys: overall_assessment, key_strengths, key_improvements,
@@ -137,14 +145,14 @@ async def generate_summary(
     system_prompt = get_summary_prompt(role, level, answers, avg_score, language=language, mode=mode)
     try:
         response = await client.chat.completions.create(
-            model=config.OPENAI_MODEL,
+            model=model or config.OPENAI_MODEL,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": "Generate the session summary."},
             ],
             temperature=0.4,
-            max_tokens=800,
+            max_completion_tokens=800,
         )
         data = json.loads(response.choices[0].message.content)
         result = {
@@ -189,12 +197,12 @@ _FALLBACK_QUESTIONS: dict[str, list[str]] = {
         "Describe a CI/CD pipeline for a full-stack application.",
         "How do you version a public REST API without breaking clients?",
     ],
-    "ML": [
-        "Explain the bias-variance tradeoff and how it affects model selection.",
-        "How does gradient descent work and what are common variants?",
-        "How would you handle a heavily imbalanced dataset?",
-        "What is cross-validation and why is it important?",
-        "Describe the difference between supervised and unsupervised learning.",
+    "System Design": [
+        "Design a URL shortener like TinyURL. Discuss the data model, API, and how you'd handle 1 billion URLs.",
+        "Design Twitter's timeline. How would you support 500M users posting and reading tweets in real-time?",
+        "Design a real-time chat application like WhatsApp. Cover message delivery, offline support, and scaling.",
+        "Design YouTube. Discuss video upload, transcoding pipeline, CDN strategy, and recommendation serving.",
+        "Design Uber's ride-matching system. How would you handle millions of concurrent ride requests?",
     ],
 }
 
@@ -202,8 +210,10 @@ _FALLBACK_QUESTIONS: dict[str, list[str]] = {
 def _fallback_question(role: str, question_number: int) -> dict:
     """Return a hardcoded question when the API is unavailable."""
     questions = _FALLBACK_QUESTIONS.get(role, _FALLBACK_QUESTIONS["Backend"])
+    q_text = questions[(question_number - 1) % len(questions)]
     return {
-        "question": questions[(question_number - 1) % len(questions)],
+        "question": q_text,
+        "question_text": q_text,
         "category": "Technical",
         "expected_topics": [],
         "difficulty": "Medium",
