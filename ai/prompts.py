@@ -173,7 +173,9 @@ Respond with ONLY valid JSON:
   "key_improvements": ["<area>", "<area>", "<area>"],
   "topics_to_study": ["<topic>", "<topic>", "<topic>", "<topic>"],
   "overall_rating": "<Excellent | Good | Needs Improvement | Significant Work Required>"
-}}"""
+}}
+"""
+
 
 _BEHAVIORAL_SUMMARY_SYSTEM = """\
 You are an expert behavioral interview coach providing a post-session debrief focused on STAR (Situation, Task, Action, Result) method improvement.
@@ -257,6 +259,22 @@ Respond with ONLY valid JSON:
   "overall_rating": "<Excellent | Good | Needs Improvement | Significant Work Required>"
 }}"""
 
+_RESUME_EVALUATION_SECTION = """
+
+--- CV Context ---
+The candidate's resume indicates:
+{resume_context}
+
+When evaluating the answer, consider whether the candidate leveraged their stated experience and skills. If their answer aligns well with their CV background, acknowledge it. If they missed an area they should know based on their CV, note it in improvements. If the answer demonstrates deep knowledge in their stated area of expertise, reflect that in the score."""
+
+_RESUME_SUMMARY_SECTION = """
+
+--- CV Context ---
+The candidate's resume indicates:
+{resume_context}
+
+When generating the summary, personalize it based on the candidate's CV profile. Mention if they performed well in areas matching their stated expertise, and suggest study topics that would fill gaps in their profile. Tailor the overall assessment to their experience level as shown in the CV."""
+
 
 def get_question_prompt(
     role: str,
@@ -322,12 +340,13 @@ def get_evaluation_prompt(
     language: str = "en",
     time_taken_seconds: int | None = None,
     mode: str = "technical",
+    resume_context: str = "",
 ) -> str:
     """Return a filled system prompt for answer evaluation."""
     lang_inst = _LANGUAGE_MAP.get(language, _LANGUAGE_MAP["en"])
 
     if mode == "behavioral":
-        return _BEHAVIORAL_EVALUATION_SYSTEM.format(
+        result = _BEHAVIORAL_EVALUATION_SYSTEM.format(
             role=role,
             level=level,
             question=question,
@@ -335,8 +354,8 @@ def get_evaluation_prompt(
             language_instruction=lang_inst,
         )
 
-    if mode == "system_design" or role == "System Design":
-        return _SD_EVALUATION_SYSTEM.format(
+    elif mode == "system_design" or role == "System Design":
+        result = _SD_EVALUATION_SYSTEM.format(
             role=role,
             level=level,
             question=question,
@@ -344,26 +363,32 @@ def get_evaluation_prompt(
             language_instruction=lang_inst,
         )
 
-    if time_taken_seconds is not None:
-        timing_section = (
-            f"\n\nAnswer time: {time_taken_seconds} seconds\n"
-            "Consider whether the candidate answered too quickly (rushed, insufficient depth),\n"
-            "too slowly (hesitation, lack of fluency), or at a good pace for this question type."
-        )
-        timing_json = ',\n  "timing_analysis": "<brief 1-sentence assessment of response speed>"'
     else:
-        timing_section = ""
-        timing_json = ""
+        if time_taken_seconds is not None:
+            timing_section = (
+                f"\n\nAnswer time: {time_taken_seconds} seconds\n"
+                "Consider whether the candidate answered too quickly (rushed, insufficient depth),\n"
+                "too slowly (hesitation, lack of fluency), or at a good pace for this question type."
+            )
+            timing_json = ',\n  "timing_analysis": "<brief 1-sentence assessment of response speed>"'
+        else:
+            timing_section = ""
+            timing_json = ""
 
-    return _EVALUATION_SYSTEM.format(
-        role=role,
-        level=level,
-        question=question,
-        answer=answer,
-        timing_section=timing_section,
-        timing_json=timing_json,
-        language_instruction=lang_inst,
-    )
+        result = _EVALUATION_SYSTEM.format(
+            role=role,
+            level=level,
+            question=question,
+            answer=answer,
+            timing_section=timing_section,
+            timing_json=timing_json,
+            language_instruction=lang_inst,
+        )
+
+    if resume_context:
+        result += _RESUME_EVALUATION_SECTION.format(resume_context=resume_context)
+
+    return result
 
 
 def get_summary_prompt(
@@ -373,6 +398,7 @@ def get_summary_prompt(
     avg_score: float,
     language: str = "en",
     mode: str = "technical",
+    resume_context: str = "",
 ) -> str:
     """Return a filled system prompt for session summary generation."""
     lines = []
@@ -389,7 +415,7 @@ def get_summary_prompt(
     lang_inst = _LANGUAGE_MAP.get(language, _LANGUAGE_MAP["en"])
 
     if mode == "behavioral":
-        return _BEHAVIORAL_SUMMARY_SYSTEM.format(
+        result = _BEHAVIORAL_SUMMARY_SYSTEM.format(
             role=role,
             level=level,
             avg_score=avg_score,
@@ -397,8 +423,8 @@ def get_summary_prompt(
             language_instruction=lang_inst,
         )
 
-    if mode == "system_design" or role == "System Design":
-        return _SD_SUMMARY_SYSTEM.format(
+    elif mode == "system_design" or role == "System Design":
+        result = _SD_SUMMARY_SYSTEM.format(
             role=role,
             level=level,
             avg_score=avg_score,
@@ -406,10 +432,16 @@ def get_summary_prompt(
             language_instruction=lang_inst,
         )
 
-    return _SUMMARY_SYSTEM.format(
-        role=role,
-        level=level,
-        avg_score=avg_score,
-        qa_summary=qa_summary,
-        language_instruction=lang_inst,
-    )
+    else:
+        result = _SUMMARY_SYSTEM.format(
+            role=role,
+            level=level,
+            avg_score=avg_score,
+            qa_summary=qa_summary,
+            language_instruction=lang_inst,
+        )
+
+    if resume_context:
+        result += _RESUME_SUMMARY_SECTION.format(resume_context=resume_context)
+
+    return result

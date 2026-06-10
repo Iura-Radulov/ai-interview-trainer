@@ -75,7 +75,7 @@ async def generate_question(
         return _fallback_question(role, question_number)
 
 
-async def evaluate_answer(role: str, level: str, question: str, answer: str, language: str = "en", time_taken_seconds: int | None = None, mode: str = "technical", model: Optional[str] = None) -> dict:
+async def evaluate_answer(role: str, level: str, question: str, answer: str, language: str = "en", time_taken_seconds: int | None = None, mode: str = "technical", model: Optional[str] = None, resume_context: str = "") -> dict:
     """Evaluate a candidate's answer via AI.
 
     Args:
@@ -87,13 +87,14 @@ async def evaluate_answer(role: str, level: str, question: str, answer: str, lan
         time_taken_seconds: Optional time spent answering (for Premium timing analysis).
         mode: "technical" for tech interviews, "behavioral" for behavioral/STAR sessions.
         model: Optional model override (e.g. "gpt-5.4" for Premium). Defaults to config.OPENAI_MODEL.
+        resume_context: Optional context from CV/resume for personalised evaluation.
 
     Returns:
         Dict with keys: score, feedback, strengths, improvements, tip, timing_analysis,
         and for behavioral mode also: star_analysis.
     """
     client = _get_client()
-    system_prompt = get_evaluation_prompt(role, level, question, answer, language=language, time_taken_seconds=time_taken_seconds, mode=mode)
+    system_prompt = get_evaluation_prompt(role, level, question, answer, language=language, time_taken_seconds=time_taken_seconds, mode=mode, resume_context=resume_context)
     try:
         response = await client.chat.completions.create(
             model=model or config.OPENAI_MODEL,
@@ -123,7 +124,7 @@ async def evaluate_answer(role: str, level: str, question: str, answer: str, lan
 
 
 async def generate_summary(
-    role: str, level: str, answers: list[dict], avg_score: float, language: str = "en", mode: str = "technical", model: Optional[str] = None
+    role: str, level: str, answers: list[dict], avg_score: float, language: str = "en", mode: str = "technical", model: Optional[str] = None, resume_context: str = ""
 ) -> dict:
     """Generate a post-session summary via AI.
 
@@ -135,6 +136,7 @@ async def generate_summary(
         language: Output language code ("en" or "ru").
         mode: "technical" for tech interviews, "behavioral" for behavioral/STAR sessions.
         model: Optional model override (e.g. "gpt-5.4" for Premium). Defaults to config.OPENAI_MODEL.
+        resume_context: Optional context from CV/resume for personalised summary.
 
     Returns:
         Dict with keys: overall_assessment, key_strengths, key_improvements,
@@ -142,7 +144,7 @@ async def generate_summary(
         For behavioral mode also: star_breakdown, competency_scores.
     """
     client = _get_client()
-    system_prompt = get_summary_prompt(role, level, answers, avg_score, language=language, mode=mode)
+    system_prompt = get_summary_prompt(role, level, answers, avg_score, language=language, mode=mode, resume_context=resume_context)
     try:
         response = await client.chat.completions.create(
             model=model or config.OPENAI_MODEL,

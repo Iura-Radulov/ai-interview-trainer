@@ -9,7 +9,7 @@ from sqlalchemy import and_, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import config
-from db.models import Answer, Base, Session, User
+from db.models import Answer, Base, Session, StudyPlan, StudyPlanDay, StudyPlanSession, User
 
 logger = logging.getLogger(__name__)
 
@@ -688,3 +688,351 @@ async def delete_user_company(company_id: int, telegram_id: int) -> bool:
         )
         await sess.commit()
         return result.rowcount > 0
+
+
+# ── Study Plan CRUD ──────────────────────────────────────────────────────────────
+
+
+async def get_user_sessions_for_plan(
+    db_user_id: int,
+    mode: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> list[dict]:
+    """Fetch interview sessions for a user, optionally filtered by mode and date range."""
+    conditions = ["s.user_id = :uid"]
+    params: dict = {"uid": db_user_id}
+
+    if mode:
+        conditions.append("s.mode = :mode")
+        params["mode"] = mode
+    if date_from:
+        conditions.append("s.started_at >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        conditions.append("s.started_at < date(:date_to, '+1 day')")
+        params["date_to"] = date_to
+
+    where_clause = " AND ".join(conditions)
+    sql = (
+        f"SELECT s.id, s.role, s.mode, s.started_at, s.completed, s.total_score, "
+        f"s.experience_level "
+        f"FROM sessions s WHERE {where_clause} ORDER BY s.started_at DESC"
+    )
+
+    async with async_session() as sess:
+        result = await sess.execute(text(sql), params)
+        rows = result.fetchall()
+        return [
+            {
+                "id": r[0],
+                "role": r[1],
+                "mode": r[2],
+                "started_at": str(r[3]) if r[3] else None,
+                "completed": bool(r[4]),
+                "total_score": r[5],
+                "experience_level": r[6],
+            }
+            for r in rows
+        ]
+
+
+async def get_sessions_with_answers(session_ids: list[int]) -> list[dict]:
+    """Fetch sessions with their answers for study plan generation."""
+    if not session_ids:
+        return []
+
+    ids_placeholders = ", ".join(str(sid) for sid in session_ids)
+    sql = (
+        f"SELECT s.id, s.role, s.mode, s.experience_level, s.started_at, "
+        f"s.completed, s.total_score, "
+        f"a.question_number, a.question_text, a.user_answer, a.score, "
+        f"a.feedback, a.strengths, a.improvements, a.tip, a.category "
+        f"FROM sessions s "
+        f"LEFT JOIN answers a ON a.session_id = s.id "
+        f"WHERE s.id IN ({ids_placeholders}) "
+        f"ORDER BY s.id, a.question_number"
+    )
+
+    async with async_session() as sess:
+        result = await sess.execute(text(sql))
+        rows = result.fetchall()
+
+    sessions_map: dict[int, dict] = {}
+    for row in rows:
+        sid = row[0]
+        if sid not in sessions_map:
+            sessions_map[sid] = {
+                "id": sid,
+                "role": row[1],
+                "mode": row[2],
+                "experience_level": row[3],
+                "started_at": str(row[4]) if row[4] else None,
+                "completed": bool(row[5]),
+                "total_score": row[6],
+                "answers": [],
+            }
+        if row[7] is not None:
+            import json as _json
+            sessions_map[sid]["answers"].append({
+                "question_number": row[7],
+                "question_text": row[8],
+                "user_answer": row[9],
+                "score": row[10],
+                "feedback": row[11],
+                "strengths": _json.loads(row[12]) if row[12] else [],
+                "improvements": _json.loads(row[13]) if row[13] else [],
+                "tip": row[14] or "",
+                "category": row[15] or "Technical",
+            })
+
+    return list(sessions_map.values())
+
+
+async def create_study_plan(
+    user_id: int,
+    title: str,
+    description: str,
+    focus_areas: list[str],
+    duration_days: int,
+    source_type: str,
+    source_params: dict,
+    language: str,
+    session_ids: list[int],
+    days_data: list[dict],
+) -> dict:
+    """Create a new study plan with its days and session links."""
+    import json as _json
+
+    async with async_session() as sess:
+        plan = StudyPlan(
+            user_id=user_id,
+            title=title,
+            description=description,
+            focus_areas=_json.dumps(focus_areas),
+            duration_days=duration_days,
+            status="active",
+            progress_percent=0,
+            source_type=source_type,
+            source_params=_json.dumps(source_params),
+            language=language,
+        )
+        sess.add(plan)
+        await sess.flush()
+
+        for day_data in days_data:
+            day = StudyPlanDay(
+                plan_id=plan.id,
+                day_number=day_data["day_number"],
+                title=day_data["title"],
+                description=day_data.get("description", ""),
+                resources=_json.dumps(day_data.get("resources", [])),
+                estimated_minutes=day_data.get("estimated_minutes"),
+            )
+            sess.add(day)
+
+        for sid in session_ids:
+            link = StudyPlanSession(plan_id=plan.id, session_id=sid)
+            sess.add(link)
+
+        await sess.commit()
+
+        return {
+            "id": plan.id,
+            "user_id": plan.user_id,
+            "title": plan.title,
+            "description": plan.description,
+            "focus_areas": focus_areas,
+            "duration_days": plan.duration_days,
+            "status": plan.status,
+            "progress_percent": plan.progress_percent,
+            "source_type": plan.source_type,
+            "source_params": source_params,
+            "language": plan.language,
+            "created_at": plan.created_at.isoformat() if plan.created_at else None,
+        }
+
+
+async def get_user_study_plans(db_user_id: int) -> list[dict]:
+    """Fetch all study plans for a user with day counts and progress."""
+    import json as _json
+
+    async with async_session() as sess:
+        result = await sess.execute(
+            text(
+                "SELECT sp.id, sp.title, sp.description, sp.focus_areas, "
+                "sp.duration_days, sp.status, sp.progress_percent, "
+                "sp.source_type, sp.source_params, sp.language, "
+                "sp.created_at, sp.started_at, sp.completed_at, "
+                "(SELECT COUNT(*) FROM study_plan_days spd WHERE spd.plan_id = sp.id) as total_days, "
+                "(SELECT COUNT(*) FROM study_plan_days spd WHERE spd.plan_id = sp.id AND spd.is_completed = 1) as completed_days "
+                "FROM study_plans sp "
+                "WHERE sp.user_id = :uid "
+                "ORDER BY sp.created_at DESC"
+            ),
+            {"uid": db_user_id},
+        )
+        rows = result.fetchall()
+        return [
+            {
+                "id": r[0],
+                "title": r[1],
+                "description": r[2],
+                "focus_areas": _json.loads(r[3]) if r[3] else [],
+                "duration_days": r[4],
+                "status": r[5],
+                "progress_percent": r[6],
+                "source_type": r[7],
+                "source_params": _json.loads(r[8]) if r[8] else {},
+                "language": r[9],
+                "created_at": str(r[10]) if r[10] else None,
+                "started_at": str(r[11]) if r[11] else None,
+                "completed_at": str(r[12]) if r[12] else None,
+                "total_days": r[13],
+                "completed_days": r[14],
+            }
+            for r in rows
+        ]
+
+
+async def get_study_plan_detail(plan_id: int, db_user_id: int) -> dict | None:
+    """Fetch a study plan with all its days, verifying ownership."""
+    import json as _json
+
+    async with async_session() as sess:
+        result = await sess.execute(
+            text(
+                "SELECT sp.id, sp.user_id, sp.title, sp.description, sp.focus_areas, "
+                "sp.duration_days, sp.status, sp.progress_percent, "
+                "sp.source_type, sp.source_params, sp.language, "
+                "sp.created_at, sp.started_at, sp.completed_at "
+                "FROM study_plans sp WHERE sp.id = :pid"
+            ),
+            {"pid": plan_id},
+        )
+        row = result.one_or_none()
+        if not row or row[1] != db_user_id:
+            return None
+
+        days_result = await sess.execute(
+            text(
+                "SELECT id, day_number, title, description, resources, "
+                "estimated_minutes, is_completed, completed_at "
+                "FROM study_plan_days WHERE plan_id = :pid ORDER BY day_number"
+            ),
+            {"pid": plan_id},
+        )
+        days = [
+            {
+                "id": d[0],
+                "day_number": d[1],
+                "title": d[2],
+                "description": d[3],
+                "resources": _json.loads(d[4]) if d[4] else [],
+                "estimated_minutes": d[5],
+                "is_completed": bool(d[6]),
+                "completed_at": str(d[7]) if d[7] else None,
+            }
+            for d in days_result.fetchall()
+        ]
+
+        sess_result = await sess.execute(
+            text("SELECT session_id FROM study_plan_sessions WHERE plan_id = :pid"),
+            {"pid": plan_id},
+        )
+        session_ids = [s[0] for s in sess_result.fetchall()]
+
+        return {
+            "id": row[0],
+            "user_id": row[1],
+            "title": row[2],
+            "description": row[3],
+            "focus_areas": _json.loads(row[4]) if row[4] else [],
+            "duration_days": row[5],
+            "status": row[6],
+            "progress_percent": row[7],
+            "source_type": row[8],
+            "source_params": _json.loads(row[9]) if row[9] else {},
+            "language": row[10],
+            "created_at": str(row[11]) if row[11] else None,
+            "started_at": str(row[12]) if row[12] else None,
+            "completed_at": str(row[13]) if row[13] else None,
+            "days": days,
+            "session_ids": session_ids,
+            "total_days": len(days),
+            "completed_days": sum(1 for d in days if d["is_completed"]),
+        }
+
+
+async def update_study_plan_status(plan_id: int, db_user_id: int, status: str) -> bool:
+    """Update plan status (active/paused/completed) with ownership check."""
+    async with async_session() as sess:
+        result = await sess.execute(
+            text("SELECT id, user_id FROM study_plans WHERE id = :pid"),
+            {"pid": plan_id},
+        )
+        row = result.one_or_none()
+        if not row or row[1] != db_user_id:
+            return False
+
+        completed_clause = ", completed_at = datetime('now')" if status == "completed" else ""
+        started_clause = ", started_at = datetime('now')" if status == "active" else ""
+
+        await sess.execute(
+            text(
+                f"UPDATE study_plans SET status = :status{completed_clause}{started_clause} WHERE id = :pid"
+            ),
+            {"status": status, "pid": plan_id},
+        )
+        await sess.commit()
+        return True
+
+
+async def mark_study_plan_day(plan_id: int, day_id: int, db_user_id: int) -> bool:
+    """Toggle a day as completed and recalculate plan progress."""
+    async with async_session() as sess:
+        result = await sess.execute(
+            text(
+                "SELECT sp.id FROM study_plans sp "
+                "JOIN study_plan_days spd ON spd.plan_id = sp.id "
+                "WHERE sp.id = :pid AND spd.id = :did AND sp.user_id = :uid"
+            ),
+            {"pid": plan_id, "did": day_id, "uid": db_user_id},
+        )
+        if not result.one_or_none():
+            return False
+
+        await sess.execute(
+            text(
+                "UPDATE study_plan_days SET is_completed = CASE WHEN is_completed = 1 THEN 0 ELSE 1 END, "
+                "completed_at = CASE WHEN is_completed = 0 THEN datetime('now') ELSE NULL END "
+                "WHERE id = :did"
+            ),
+            {"did": day_id},
+        )
+        await sess.commit()
+
+    await _recalc_plan_progress(plan_id)
+    return True
+
+
+async def _recalc_plan_progress(plan_id: int) -> None:
+    """Recalculate progress_percent for a plan based on completed days."""
+    async with async_session() as sess:
+        result = await sess.execute(
+            text(
+                "SELECT COUNT(*), SUM(CASE WHEN is_completed = 1 THEN 1 ELSE 0 END) "
+                "FROM study_plan_days WHERE plan_id = :pid"
+            ),
+            {"pid": plan_id},
+        )
+        row = result.one()
+        total = row[0]
+        completed = row[1] or 0
+        pct = int((completed / total * 100)) if total > 0 else 0
+
+        await sess.execute(
+            text("UPDATE study_plans SET progress_percent = :pct WHERE id = :pid"),
+            {"pct": pct, "pid": plan_id},
+        )
+        await sess.commit()

@@ -45,6 +45,16 @@ def _resolve_model(plan_name: str) -> str:
 # ── Pydantic request models ───────────────────────────────────────────────────
 
 
+class GapAnalysisRequest(BaseModel):
+    target_role: str
+    target_level: str
+    resume_id: Optional[int] = None  # If not provided, uses latest resume
+    skills: Optional[str] = None
+    company_id: Optional[str] = None
+    user_company_id: Optional[int] = None
+    language: str = "en"
+
+
 class AuthRequest(BaseModel):
     init_data: str
 
@@ -56,6 +66,7 @@ class StartInterviewRequest(BaseModel):
     company_id: Optional[str] = None
     user_company_id: Optional[int] = None
     mode: str = "technical"  # "technical" or "behavioral"
+    resume_id: Optional[int] = None  # For CV-aware interviews
 
 
 class AnswerRequest(BaseModel):
@@ -63,6 +74,24 @@ class AnswerRequest(BaseModel):
     question_text: str  # The question that was asked — needed for stateless evaluation
     answer: str
     time_taken_seconds: Optional[int] = None
+    resume_id: Optional[int] = None  # For CV-aware evaluation
+
+
+class GeneratePlanRequest(BaseModel):
+    """Request to generate a study plan based on past interviews."""
+    mode: Optional[str] = None  # 'technical' | 'behavioral' | None = both
+    date_from: Optional[str] = None  # ISO date string (inclusive)
+    date_to: Optional[str] = None  # ISO date string (inclusive)
+    duration_days: int = 7  # 3, 5, 7, 14, 30
+    language: str = "en"
+
+
+class UpdatePlanStatusRequest(BaseModel):
+    status: str  # 'active' | 'paused' | 'completed'
+
+
+class MarkDayRequest(BaseModel):
+    day_id: int
 
 
 # ── Auth dependency ───────────────────────────────────────────────────────────
@@ -208,6 +237,97 @@ async def create_auth_token_endpoint(
         raise HTTPException(status_code=500, detail="Failed to create token")
 
 
+# ── CV Gap Analysis ──────────────────────────────────────────────────────
+
+
+@router.post("/interview/gap-analysis")
+async def get_gap_analysis(
+    request: GapAnalysisRequest,
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Analyze gap between user's CV/resume and target position before interview."""
+    from ai.gap_analyzer import analyze_gap as _analyze_gap
+
+    telegram_id = user_data.get("id", 0)
+    if not telegram_id or telegram_id == 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    async with async_session() as sess:
+        if request.resume_id:
+            result = await sess.execute(
+                text(
+                    "SELECT id, user_id, role, experience_level, analysis_result FROM user_resumes "
+                    "WHERE id = :rid AND user_id = :uid"
+                ),
+                {"rid": request.resume_id, "uid": db_user_id},
+            )
+        else:
+            # Use the latest resume for this user
+            result = await sess.execute(
+                text(
+                    "SELECT id, user_id, role, experience_level, analysis_result FROM user_resumes "
+                    "WHERE user_id = :uid ORDER BY id DESC LIMIT 1"
+                ),
+                {"uid": db_user_id},
+            )
+        row = result.one_or_none()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Resume not found. Upload your CV first.")
+
+    role_from_db = row[2] or ""
+    level_from_db = row[3] or ""
+    analysis_raw = row[4] or "{}"
+
+    # Parse analysis JSON (deep analysis: strengths, missing_keywords, etc.)
+    try:
+        import json as _json
+        deep_analysis = _json.loads(analysis_raw) if isinstance(analysis_raw, str) else analysis_raw
+    except Exception:
+        deep_analysis = {}
+
+    # Get company context if provided
+    company_context = ""
+    if request.company_id:
+        from api.companies import get_company_context
+        company_context = get_company_context(request.company_id)
+    elif request.user_company_id:
+        async with async_session() as sess:
+            result = await sess.execute(
+                text(
+                    "SELECT ai_context FROM user_companies "
+                    "WHERE id = :ucid AND user_id = (SELECT id FROM users WHERE telegram_id = :tid)"
+                ),
+                {"ucid": request.user_company_id, "tid": telegram_id},
+            )
+            row_ctx = result.one_or_none()
+            if row_ctx:
+                company_context = row_ctx[0] or ""
+
+    plan_name = await get_user_plan_name(telegram_id)
+    model = _resolve_model(plan_name)
+
+    tech_stack_raw = deep_analysis.get("missing_keywords", [])
+    strengths_raw = deep_analysis.get("strengths", [])
+
+    gap = await _analyze_gap(
+        target_role=request.target_role,
+        target_level=request.target_level,
+        cv_role=role_from_db,
+        cv_level=level_from_db,
+        tech_stack=tech_stack_raw,
+        years_experience=None,
+        key_skills=strengths_raw,
+        cv_confidence=0.7,
+        company_context=company_context,
+        skills=request.skills or "",
+        language=request.language,
+        model=model,
+    )
+    return gap
+
+
 @router.post("/interview/start")
 async def start_interview(
     request: StartInterviewRequest,
@@ -308,6 +428,44 @@ async def submit_answer(
         plan_name = await get_user_plan_name(telegram_id)
         model = _resolve_model(plan_name)
 
+        # Build resume_context for CV-aware evaluation
+        resume_context = ""
+        if request.resume_id:
+            try:
+                import json as _json
+                async with async_session() as _sess:
+                    _result = await _sess.execute(
+                        text("SELECT role, experience_level, analysis_result FROM user_resumes WHERE id = :rid AND user_id = :uid"),
+                        {"rid": request.resume_id, "uid": db_user_id},
+                    )
+                    _row = _result.one_or_none()
+                if _row:
+                    _parts = []
+                    if _row[0]:
+                        _parts.append(f"CV detected role: {_row[0]}")
+                    if _row[1]:
+                        _parts.append(f"CV detected level: {_row[1]}")
+                    if _row[2]:
+                        try:
+                            _deep = _json.loads(_row[2]) if isinstance(_row[2], str) else _row[2]
+                            # Simple analyzer keys (from /resume/upload)
+                            if _deep.get("tech_stack"):
+                                _parts.append(f"Known technologies: {', '.join(_deep['tech_stack'][:8])}")
+                            if _deep.get("key_skills"):
+                                _parts.append(f"Key skills: {', '.join(_deep['key_skills'][:8])}")
+                            if _deep.get("years_experience"):
+                                _parts.append(f"Years of experience: {_deep['years_experience']}")
+                            # Deep analyzer keys (from /user-resumes/upload)
+                            if _deep.get("missing_keywords"):
+                                _parts.append(f"Known technologies: {', '.join(_deep['missing_keywords'][:8])}")
+                            if _deep.get("strengths"):
+                                _parts.append(f"Key skills: {', '.join(_deep['strengths'][:8])}")
+                        except Exception:
+                            pass
+                    resume_context = "\n".join(_parts)
+            except Exception as _exc:
+                logger.warning("Failed to build resume_context: %s", _exc)
+
         evaluation = await evaluate_answer(
             role=session.role,
             level=session.experience_level,
@@ -317,6 +475,7 @@ async def submit_answer(
             time_taken_seconds=request.time_taken_seconds,
             mode=getattr(session, 'mode', 'technical'),
             model=model,
+            resume_context=resume_context,
         )
 
         # Persist the evaluated answer
@@ -377,6 +536,7 @@ async def submit_answer(
                 language=language,
                 mode=getattr(session, 'mode', 'technical'),
                 model=model,
+                resume_context=resume_context,
             )
 
             return {
@@ -457,6 +617,7 @@ async def voice_answer(
             language=language,
             time_taken_seconds=time_taken_seconds,
             mode=getattr(session, 'mode', 'technical'),
+            resume_context="",
         )
 
         # ── Persist answer ───────────────────────────────────────────────────────
@@ -1129,30 +1290,68 @@ async def analyze_resume_upload(
     file: UploadFile = File(...),
     user_data: dict = Depends(get_current_user),
 ) -> dict:
-    """Upload a PDF resume file, extract text with PyMuPDF, and analyze it."""
+    """Upload a PDF resume file, extract text with PyMuPDF, analyze it, and persist to DB."""
+    from ai.resume_analyzer import analyze_resume as _analyze_resume
+
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
 
-    from ai.resume_analyzer import analyze_resume as _analyze_resume
-
-    tmp_path = os.path.join(tempfile.gettempdir(), f"upload_resume_{user_data.get('id', '0')}.pdf")
+    tmp_path = os.path.join(tempfile.gettempdir(), f"upload_resume_{telegram_id}.pdf")
     try:
         content = await file.read()
         with open(tmp_path, "wb") as f:
             f.write(content)
 
         pdf_doc = fitz.open(tmp_path)
-        text = "\n".join(page.get_text() for page in pdf_doc)
+        pdf_text = "\n".join(page.get_text() for page in pdf_doc)
         pdf_doc.close()
 
-        if not text.strip():
+        if not pdf_text.strip():
             raise HTTPException(
                 status_code=400,
                 detail="Could not extract text from this PDF. It may be a scanned/image-only document.",
             )
 
-        text = text[:10_000]
-        result = await _analyze_resume(text)
+        pdf_text = pdf_text[:10_000]
+        result = await _analyze_resume(pdf_text)
+
+        # Persist to user_resumes table so gap analysis & interview can reference it
+        role = result.get("suggested_role") or ""
+        level = result.get("suggested_level") or ""
+        analysis_json = json.dumps(result)
+
+        # Save PDF to persistent storage
+        os.makedirs(_RESUMES_DIR, exist_ok=True)
+        safe_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{telegram_id}_{file.filename}"
+        file_path = os.path.join(_RESUMES_DIR, safe_name)
+        with open(file_path, "wb") as f:
+            f.write(content)
+
+        async with async_session() as sess:
+            res = await sess.execute(
+                text(
+                    "INSERT INTO user_resumes (user_id, role, experience_level, original_filename, file_path, analysis_result, created_at) "
+                    "VALUES (:uid, :role, :level, :fname, :fpath, :analysis, :now) RETURNING id"
+                ),
+                {
+                    "uid": db_user_id,
+                    "role": role,
+                    "level": level,
+                    "fname": file.filename,
+                    "fpath": file_path,
+                    "analysis": analysis_json,
+                    "now": datetime.utcnow().isoformat(),
+                },
+            )
+            resume_id = res.scalar()
+            await sess.commit()
+
+        result["id"] = resume_id
         return result
     except HTTPException:
         raise
@@ -1644,3 +1843,184 @@ async def _generate_company_context(
             "this company and role. Assess both technical skills and cultural fit."
         )
         return fallback
+
+
+# ── Study Plan endpoints ──────────────────────────────────────────────────────
+
+
+@router.get("/study/sessions-for-plan")
+async def get_sessions_for_plan(
+    mode: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Fetch interview sessions that can be used for study plan generation."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    from db.database import get_user_sessions_for_plan
+    sessions = await get_user_sessions_for_plan(
+        db_user_id=db_user_id,
+        mode=mode,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return {"sessions": sessions}
+
+
+@router.post("/study/plans/generate")
+async def generate_plan(
+    request: GeneratePlanRequest,
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Generate a personalised study plan based on interview performance.
+
+    Filters interviews by mode (technical/behavioral/both) and date range,
+    then sends them to AI for plan generation.
+    """
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    from db.database import get_user_sessions_for_plan, get_sessions_with_answers, create_study_plan
+    from ai.study_planner import generate_study_plan as _generate
+    from db.database import get_user_plan_name
+
+    # 1. Get matching sessions (includes both completed AND incomplete)
+    sessions_meta = await get_user_sessions_for_plan(
+        db_user_id=db_user_id,
+        mode=request.mode,
+        date_from=request.date_from,
+        date_to=request.date_to,
+    )
+
+    if not sessions_meta:
+        raise HTTPException(status_code=404, detail="No interviews found matching your filters. Try a wider date range or different mode.")
+
+    session_ids = [s["id"] for s in sessions_meta]
+
+    # 2. Fetch full session data with answers
+    sessions_data = await get_sessions_with_answers(session_ids)
+
+    if not sessions_data:
+        raise HTTPException(status_code=404, detail="Could not load interview data. Please try again.")
+
+    # 3. Resolve model by plan
+    plan_name = await get_user_plan_name(telegram_id)
+    model = config.OPENAI_MODEL_PREMIUM if plan_name == "Premium" else config.OPENAI_MODEL
+
+    # 4. Generate plan via AI
+    plan_result = await _generate(
+        user_id=db_user_id,
+        session_data=sessions_data,
+        duration_days=request.duration_days,
+        mode=request.mode,
+        language=request.language,
+        model=model,
+    )
+
+    # 5. Save to database
+    source_params = {
+        "mode": request.mode,
+        "date_from": request.date_from,
+        "date_to": request.date_to,
+        "session_count": len(session_ids),
+    }
+
+    created = await create_study_plan(
+        user_id=db_user_id,
+        title=plan_result["title"],
+        description=plan_result["description"],
+        focus_areas=plan_result["focus_areas"],
+        duration_days=plan_result["duration_days"],
+        source_type="interview",
+        source_params=source_params,
+        language=request.language,
+        session_ids=session_ids,
+        days_data=plan_result["days_data"],
+    )
+
+    return {
+        "ok": True,
+        "plan": created,
+        "message": f"Study plan '{plan_result['title']}' created!",
+    }
+
+
+@router.get("/study/plans")
+async def list_study_plans(
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """List all study plans for the current user."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    from db.database import get_user_study_plans
+    plans = await get_user_study_plans(db_user_id)
+    return {"plans": plans}
+
+
+@router.get("/study/plans/{plan_id}")
+async def get_study_plan_detail(
+    plan_id: int,
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Get full study plan detail with days."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    from db.database import get_study_plan_detail
+    plan = await get_study_plan_detail(plan_id, db_user_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    return {"plan": plan}
+
+
+@router.patch("/study/plans/{plan_id}/status")
+async def update_plan_status(
+    plan_id: int,
+    request: UpdatePlanStatusRequest,
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Update study plan status (active / paused / completed)."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    valid_statuses = {"active", "paused", "completed"}
+    if request.status not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
+
+    from db.database import update_study_plan_status
+    ok = await update_study_plan_status(plan_id, db_user_id, request.status)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Plan not found or not owned")
+    return {"ok": True, "status": request.status}
+
+
+@router.post("/study/plans/{plan_id}/toggle-day")
+async def toggle_plan_day(
+    plan_id: int,
+    request: MarkDayRequest,
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Toggle a day's completion status and recalculate progress."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    from db.database import mark_study_plan_day
+    ok = await mark_study_plan_day(plan_id, request.day_id, db_user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Day or plan not found")
+    return {"ok": True}
