@@ -276,6 +276,324 @@ The candidate's resume indicates:
 When generating the summary, personalize it based on the candidate's CV profile. Mention if they performed well in areas matching their stated expertise, and suggest study topics that would fill gaps in their profile. Tailor the overall assessment to their experience level as shown in the CV."""
 
 
+# ── Guided System Design flow (7-step, Premium only) ─────────────────────────
+
+_SD_STEP_NAMES: dict[int, str] = {
+    1: "Requirements Clarification",
+    2: "Traffic & Data Estimations",
+    3: "Data Model",
+    4: "API Design",
+    5: "High-Level Architecture",
+    6: "Deep Dive",
+    7: "Trade-Offs Discussion",
+}
+
+_SD_STEP_CRITERIA: dict[int, str] = {
+    1: "functional requirements, non-functional requirements (scale, latency, durability), edge cases considered",
+    2: "DAU/MAU estimation, reads/sec, writes/sec, storage calculation, quality of reasoning methodology",
+    3: "schema design, normalization, indexing strategy, relationships between entities, scalability considerations",
+    4: "endpoint completeness, RESTful conventions, request/response design, auth endpoints, versioning",
+    5: "component coverage (load balancer, API servers, DB, cache, CDN, message queue), data flow clarity, scalability",
+    6: "implementation depth, practical details, failure handling, trade-off awareness within the component",
+    7: "trade-off reasoning quality (e.g. consistency vs availability, SQL vs NoSQL), awareness of design limitations, justification of choices",
+}
+
+_SD_GUIDED_PROMPTS: dict[int, str] = {
+    1: """\
+You are an expert system design interviewer at a FAANG company conducting a structured 7-step interview.
+Problem to design: {problem}
+Candidate level: {level}
+{company_context}
+
+This is STEP 1 of 7: REQUIREMENTS CLARIFICATION.
+
+{language_instruction}
+
+Your task: Present the problem concisely and ask the candidate to clarify requirements before designing.
+Prompt them to identify:
+- Functional requirements (what the system does)
+- Non-functional requirements (scale, latency, durability, availability)
+- Scope assumptions and edge cases
+
+Respond with ONLY valid JSON — no markdown fences:
+{{
+  "step": 1,
+  "step_name": "Requirements Clarification",
+  "prompt": "<your engaging 2-3 sentence question/prompt to the candidate>",
+  "hints": ["<hint about functional requirements>", "<hint about scale/NFRs>", "<hint about scope/edge cases>"],
+  "evaluation_criteria": ["functional requirements", "non-functional requirements", "scale assumptions", "edge cases"]
+}}""",
+
+    2: """\
+You are an expert system design interviewer at a FAANG company.
+Problem: {problem}
+Candidate level: {level}
+
+This is STEP 2 of 7: TRAFFIC & DATA ESTIMATIONS.
+
+{language_instruction}
+
+Session so far:
+{previous_context}
+
+Your task: Ask the candidate to estimate traffic and data scale for their stated requirements.
+Guide them toward: DAU/MAU, reads/sec vs writes/sec, storage growth over time.
+
+Respond with ONLY valid JSON — no markdown fences:
+{{
+  "step": 2,
+  "step_name": "Traffic & Data Estimations",
+  "prompt": "<your prompt asking for traffic and data estimates>",
+  "hints": ["<hint about DAU/MAU starting point>", "<hint about read/write ratio>", "<hint about storage math>"],
+  "evaluation_criteria": ["DAU/MAU estimation", "reads/sec and writes/sec", "storage calculation", "reasoning methodology"]
+}}""",
+
+    3: """\
+You are an expert system design interviewer at a FAANG company.
+Problem: {problem}
+Candidate level: {level}
+
+This is STEP 3 of 7: DATA MODEL.
+
+{language_instruction}
+
+Session so far:
+{previous_context}
+
+Your task: Ask the candidate to design the data model — core entities, fields, relationships, indexes.
+
+Respond with ONLY valid JSON — no markdown fences:
+{{
+  "step": 3,
+  "step_name": "Data Model",
+  "prompt": "<your prompt asking for schema / data model design>",
+  "hints": ["<hint about core entities>", "<hint about relationships/foreign keys>", "<hint about indexing for hot paths>"],
+  "evaluation_criteria": ["schema design", "normalization", "indexing strategy", "scalability"]
+}}""",
+
+    4: """\
+You are an expert system design interviewer at a FAANG company.
+Problem: {problem}
+Candidate level: {level}
+
+This is STEP 4 of 7: API DESIGN.
+
+{language_instruction}
+
+Session so far:
+{previous_context}
+
+Your task: Ask the candidate to define the core API endpoints (REST, gRPC, or GraphQL as appropriate).
+
+Respond with ONLY valid JSON — no markdown fences:
+{{
+  "step": 4,
+  "step_name": "API Design",
+  "prompt": "<your prompt asking for API endpoint design>",
+  "hints": ["<hint about core CRUD endpoints>", "<hint about auth/pagination>", "<hint about idempotency or versioning>"],
+  "evaluation_criteria": ["endpoint completeness", "REST conventions", "request/response design", "auth and versioning"]
+}}""",
+
+    5: """\
+You are an expert system design interviewer at a FAANG company.
+Problem: {problem}
+Candidate level: {level}
+
+This is STEP 5 of 7: HIGH-LEVEL ARCHITECTURE.
+
+{language_instruction}
+
+Session so far:
+{previous_context}
+
+Your task: Ask the candidate to describe the high-level system architecture — components, their roles, and data flow.
+
+Respond with ONLY valid JSON — no markdown fences:
+{{
+  "step": 5,
+  "step_name": "High-Level Architecture",
+  "prompt": "<your prompt asking for high-level architecture description>",
+  "hints": ["<hint about load balancers and API gateway>", "<hint about caching layer / CDN>", "<hint about async processing / message queues>"],
+  "evaluation_criteria": ["component coverage", "data flow clarity", "scalability", "fault tolerance"]
+}}""",
+
+    6: """\
+You are an expert system design interviewer at a FAANG company.
+Problem: {problem}
+Candidate level: {level}
+
+This is STEP 6 of 7: DEEP DIVE.
+
+{language_instruction}
+
+Session so far:
+{previous_context}
+
+Your task: Pick the single most complex or interesting component the candidate mentioned and ask them to deep-dive into it.
+Ask about implementation details, failure scenarios, and optimizations.
+
+Respond with ONLY valid JSON — no markdown fences:
+{{
+  "step": 6,
+  "step_name": "Deep Dive",
+  "prompt": "<your prompt asking for a deep-dive into a specific component they mentioned>",
+  "hints": ["<hint about implementation detail>", "<hint about handling failure / retries>", "<hint about performance optimization>"],
+  "evaluation_criteria": ["implementation depth", "practical details", "failure handling", "trade-off awareness within component"]
+}}""",
+
+    7: """\
+You are an expert system design interviewer at a FAANG company.
+Problem: {problem}
+Candidate level: {level}
+
+This is STEP 7 of 7: TRADE-OFFS DISCUSSION.
+
+{language_instruction}
+
+Session so far:
+{previous_context}
+
+Your task: Ask the candidate to reflect on and discuss the key trade-offs in their overall design.
+Example trade-offs: consistency vs availability, SQL vs NoSQL, monolith vs microservices, latency vs throughput.
+
+Respond with ONLY valid JSON — no markdown fences:
+{{
+  "step": 7,
+  "step_name": "Trade-Offs Discussion",
+  "prompt": "<your prompt asking the candidate to discuss the key trade-offs in their design>",
+  "hints": ["<hint about CAP theorem application>", "<hint about consistency models>", "<hint about cost/complexity trade-offs>"],
+  "evaluation_criteria": ["trade-off reasoning", "awareness of design limitations", "justification of choices"]
+}}""",
+}
+
+_SD_GUIDED_EVALUATION: str = """\
+You are an expert system design interviewer at a FAANG company evaluating one step of a structured session.
+
+Problem: {problem}
+Step: {step} of 7 — {step_name}
+Candidate level: {level}
+
+The prompt/question that was given:
+{step_prompt}
+
+The candidate's answer:
+{answer}
+
+{language_instruction}
+
+Prior session context:
+{previous_context}
+
+Evaluate the candidate's answer for THIS step only. Score 1-10 based on:
+{step_criteria}
+
+Scoring guide:
+9-10 Exceptional — thorough, accurate, demonstrates clear depth
+7-8  Good — covers main points with minor gaps
+5-6  Adequate — covers basics but lacks depth or precision
+3-4  Weak — major gaps or misunderstanding
+1-2  Very poor — incorrect or no coherent answer
+
+Respond with ONLY valid JSON — no markdown fences:
+{{
+  "score": <integer 1-10>,
+  "feedback": "<1-2 sentence constructive feedback specific to this step>",
+  "hints": ["<specific actionable hint for improvement on this step>", "<another hint if relevant>"]
+}}"""
+
+_SD_GUIDED_SUMMARY: str = """\
+You are an expert system design interviewer providing a final evaluation of a complete 7-step guided session.
+
+Problem: {problem}
+Candidate level: {level}
+
+Complete session transcript:
+{all_context}
+
+{language_instruction}
+
+Provide a comprehensive final evaluation with per-component scoring (1-10).
+
+Respond with ONLY valid JSON — no markdown fences:
+{{
+  "requirements_clarity": <1-10>,
+  "estimations": <1-10>,
+  "data_model": <1-10>,
+  "api_design": <1-10>,
+  "architecture": <1-10>,
+  "deep_dive": <1-10>,
+  "trade_offs": <1-10>,
+  "overall": <1-10>,
+  "assessment": "<3-4 sentence overall assessment of the candidate's system design ability and session performance>",
+  "strengths": ["<strength 1>", "<strength 2>", "<strength 3>"],
+  "improvements": ["<improvement area 1>", "<improvement area 2>", "<improvement area 3>"],
+  "topics_to_study": ["<topic 1>", "<topic 2>", "<topic 3>"]
+}}"""
+
+
+def get_sd_step_prompt(
+    problem: str,
+    role: str,
+    level: str,
+    step: int,
+    previous_context: str = "",
+    company_context: str = "",
+    language: str = "en",
+) -> str:
+    """Return a filled system prompt for generating a guided SD step question."""
+    template = _SD_GUIDED_PROMPTS.get(step, _SD_GUIDED_PROMPTS[1])
+    lang_inst = _LANGUAGE_MAP.get(language, _LANGUAGE_MAP["en"])
+    return template.format(
+        problem=problem,
+        role=role,
+        level=level,
+        previous_context=previous_context or "None",
+        company_context=company_context or "",
+        language_instruction=lang_inst,
+    )
+
+
+def get_sd_evaluation_prompt(
+    problem: str,
+    step: int,
+    step_name: str,
+    level: str,
+    step_prompt: str,
+    answer: str,
+    previous_context: str = "",
+    language: str = "en",
+) -> str:
+    """Return a filled system prompt for evaluating a guided SD step answer."""
+    lang_inst = _LANGUAGE_MAP.get(language, _LANGUAGE_MAP["en"])
+    return _SD_GUIDED_EVALUATION.format(
+        problem=problem,
+        step=step,
+        step_name=step_name,
+        level=level,
+        step_prompt=step_prompt,
+        answer=answer,
+        previous_context=previous_context or "None",
+        step_criteria=_SD_STEP_CRITERIA.get(step, "depth, accuracy, completeness"),
+        language_instruction=lang_inst,
+    )
+
+
+def get_sd_summary_prompt(
+    problem: str,
+    level: str,
+    all_context: str,
+    language: str = "en",
+) -> str:
+    """Return a filled system prompt for generating the guided SD final summary."""
+    lang_inst = _LANGUAGE_MAP.get(language, _LANGUAGE_MAP["en"])
+    return _SD_GUIDED_SUMMARY.format(
+        problem=problem,
+        level=level,
+        all_context=all_context,
+        language_instruction=lang_inst,
+    )
+
+
 def get_question_prompt(
     role: str,
     level: str,

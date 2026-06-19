@@ -159,3 +159,22 @@ class StudyPlanSession(Base):
     session_id = Column(Integer, ForeignKey("sessions.id"), nullable=False)
 
     plan = relationship("StudyPlan", back_populates="sessions")
+
+
+class SystemDesignSession(Base):
+    """A guided 7-step system design interview session (Premium feature)."""
+
+    __tablename__ = "sd_sessions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    problem = Column(String(100), nullable=False)  # "Design YouTube", "Design Twitter", etc.
+    level = Column(String(50), nullable=True)
+    company = Column(String(50), nullable=True, default="general")
+    current_step = Column(Integer, default=1)  # 1-7
+    step_scores = Column(Text, default="[]")   # JSON: [{"step": 1, "score": 8}, ...]
+    step_context = Column(Text, default="[]")  # JSON: [{step, step_name, prompt, answer, score, feedback}]
+    summary = Column(Text, nullable=True)      # JSON: final evaluation dict
+    started_at = Column(DateTime, default=datetime.utcnow)
+    completed = Column(Boolean, default=False)
+    total_score = Column(Float, nullable=True)

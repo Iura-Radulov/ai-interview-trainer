@@ -6,9 +6,196 @@ from typing import Optional
 from openai import AsyncOpenAI
 
 import config
-from ai.prompts import get_evaluation_prompt, get_question_prompt, get_summary_prompt
+from ai.prompts import (
+    get_evaluation_prompt,
+    get_question_prompt,
+    get_sd_evaluation_prompt,
+    get_sd_step_prompt,
+    get_sd_summary_prompt,
+    get_summary_prompt,
+    _SD_STEP_NAMES,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# ── Guided System Design (7-step flow) ──────────────────────────────────
+
+
+async def generate_sd_step(
+    problem: str,
+    role: str,
+    level: str,
+    step: int,
+    previous_context: str = "",
+    company_context: str = "",
+    language: str = "en",
+    model: Optional[str] = None,
+) -> dict:
+    """Generate the AI prompt for a guided SD step.
+
+    Returns: {step, step_name, prompt, hints, evaluation_criteria}
+    """
+    client = _get_client()
+    system_prompt = get_sd_step_prompt(
+        problem=problem,
+        role=role,
+        level=level,
+        step=step,
+        previous_context=previous_context,
+        company_context=company_context,
+        language=language,
+    )
+    try:
+        response = await client.chat.completions.create(
+            model=model or config.OPENAI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Generate step {step} of 7."},
+            ],
+            temperature=0.7,
+            max_completion_tokens=600,
+        )
+        data = json.loads(response.choices[0].message.content)
+        return {
+            "step": data.get("step", step),
+            "step_name": data.get("step_name", f"Step {step}"),
+            "prompt": data.get("prompt", ""),
+            "hints": data.get("hints", []),
+            "evaluation_criteria": data.get("evaluation_criteria", []),
+        }
+    except Exception as exc:
+        logger.error("generate_sd_step failed: %s", exc)
+        return _fallback_sd_step(step)
+
+
+async def evaluate_sd_step(
+    problem: str,
+    step: int,
+    step_name: str,
+    level: str,
+    step_prompt: str,
+    answer: str,
+    previous_context: str = "",
+    language: str = "en",
+    model: Optional[str] = None,
+) -> dict:
+    """Evaluate the user's answer for one guided SD step.
+
+    Returns: {score, feedback, hints}
+    """
+    client = _get_client()
+    system_prompt = get_sd_evaluation_prompt(
+        problem=problem,
+        step=step,
+        step_name=step_name,
+        level=level,
+        step_prompt=step_prompt,
+        answer=answer,
+        previous_context=previous_context,
+        language=language,
+    )
+    try:
+        response = await client.chat.completions.create(
+            model=model or config.OPENAI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": answer},
+            ],
+            temperature=0.3,
+            max_completion_tokens=400,
+        )
+        data = json.loads(response.choices[0].message.content)
+        return {
+            "score": max(1, min(10, int(data.get("score", 5)))),
+            "feedback": data.get("feedback", ""),
+            "hints": data.get("hints", []),
+        }
+    except Exception as exc:
+        logger.error("evaluate_sd_step failed: %s", exc)
+        return {"score": 5, "feedback": "Evaluation temporarily unavailable.", "hints": []}
+
+
+async def generate_sd_summary(
+    problem: str,
+    level: str,
+    all_context: str,
+    language: str = "en",
+    model: Optional[str] = None,
+) -> dict:
+    """Generate the final comprehensive evaluation for a guided SD session.
+
+    Returns: {requirements_clarity, estimations, data_model, api_design,
+              architecture, deep_dive, trade_offs, overall, assessment,
+              strengths, improvements, topics_to_study}
+    """
+    client = _get_client()
+    system_prompt = get_sd_summary_prompt(problem=problem, level=level, all_context=all_context, language=language)
+    try:
+        response = await client.chat.completions.create(
+            model=model or config.OPENAI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Generate the final system design evaluation."},
+            ],
+            temperature=0.4,
+            max_completion_tokens=800,
+        )
+        data = json.loads(response.choices[0].message.content)
+        return {
+            "requirements_clarity": data.get("requirements_clarity", 5),
+            "estimations": data.get("estimations", 5),
+            "data_model": data.get("data_model", 5),
+            "api_design": data.get("api_design", 5),
+            "architecture": data.get("architecture", 5),
+            "deep_dive": data.get("deep_dive", 5),
+            "trade_offs": data.get("trade_offs", 5),
+            "overall": data.get("overall", 5),
+            "assessment": data.get("assessment", ""),
+            "strengths": data.get("strengths", []),
+            "improvements": data.get("improvements", []),
+            "topics_to_study": data.get("topics_to_study", []),
+        }
+    except Exception as exc:
+        logger.error("generate_sd_summary failed: %s", exc)
+        return _fallback_sd_summary()
+
+
+def _fallback_sd_step(step: int) -> dict:
+    """Return a hardcoded step prompt when AI is unavailable."""
+    prompts = {
+        1: {"prompt": "Let's start designing the system. What requirements would you clarify first?", "hints": ["Think about scale", "Consider functional vs non-functional"]},
+        2: {"prompt": "Now estimate the traffic and data scale. How many DAU? Reads vs writes?", "hints": ["Start with DAU", "Estimate reads and writes per second"]},
+        3: {"prompt": "Design the data model. What tables/collections do you need?", "hints": ["Core entities", "Relationships"]},
+        4: {"prompt": "Define the API endpoints. What endpoints would you create?", "hints": ["CRUD operations", "REST conventions"]},
+        5: {"prompt": "Describe the high-level architecture. What components are involved?", "hints": ["Load balancers", "Caching", "Database"]},
+        6: {"prompt": "Let's deep-dive into one component. Pick your most interesting component.", "hints": ["Implementation details", "Failure scenarios"]},
+        7: {"prompt": "Discuss the key trade-offs in your design.", "hints": ["CAP theorem", "Consistency vs availability"]},
+    }
+    fallback = prompts.get(step, prompts[1])
+    return {
+        "step": step,
+        "step_name": f"Step {step}",
+        "prompt": fallback["prompt"],
+        "hints": fallback["hints"],
+        "evaluation_criteria": ["depth", "accuracy", "completeness"],
+    }
+
+
+def _fallback_sd_summary() -> dict:
+    """Return a fallback summary when AI is unavailable."""
+    return {
+        "requirements_clarity": 5, "estimations": 5, "data_model": 5,
+        "api_design": 5, "architecture": 5, "deep_dive": 5, "trade_offs": 5,
+        "overall": 5,
+        "assessment": "Your system design session was completed. Review each component score to identify areas for improvement.",
+        "strengths": ["Completed the full guided session"],
+        "improvements": ["Try to provide more detail in each step", "Practice trade-off discussions"],
+        "topics_to_study": ["System design fundamentals", "Database scaling", "Caching strategies"],
+    }
 
 _client: Optional[AsyncOpenAI] = None
 

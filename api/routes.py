@@ -15,7 +15,15 @@ from pydantic import BaseModel
 from sqlalchemy import select, text
 
 import config
-from ai.interviewer import evaluate_answer, generate_question, generate_summary
+from ai.interviewer import (
+    evaluate_answer,
+    evaluate_sd_step,
+    generate_question,
+    generate_sd_step,
+    generate_sd_summary,
+    generate_summary,
+    _SD_STEP_NAMES,
+)
 from ai.resume_deep_analyzer import analyze_resume_deep
 from api.auth import validate_init_data
 from db.database import (
@@ -2024,3 +2032,299 @@ async def toggle_plan_day(
     if not ok:
         raise HTTPException(status_code=404, detail="Day or plan not found")
     return {"ok": True}
+
+
+# ── Guided System Design API (7-step flow, Premium) ─────────────────────
+
+
+class SystemDesignStartRequest(BaseModel):
+    problem: str
+    level: str
+    company: str = "general"
+
+
+class SystemDesignStepRequest(BaseModel):
+    session_id: int
+    answer: str
+
+
+@router.post("/system-design/start")
+async def sd_start(
+    request: SystemDesignStartRequest,
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Start a guided 7-step System Design session. Premium feature."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    plan = await get_user_plan_name(telegram_id)
+    if plan == "Free":
+        raise HTTPException(status_code=403, detail="System Design interviews are available for Pro and Premium users only. Upgrade your plan.")
+
+    db_user_id = await _get_db_user_id(telegram_id)
+
+    from db.models import SystemDesignSession
+
+    async with async_session() as s:
+        sd_session = SystemDesignSession(
+            user_id=db_user_id,
+            problem=request.problem,
+            level=request.level,
+            company=request.company,
+            current_step=1,
+            step_scores="[]",
+            step_context="[]",
+            completed=False,
+        )
+        s.add(sd_session)
+        await s.commit()
+        await s.refresh(sd_session)
+
+    model = _resolve_model(plan)
+    from api.companies import get_company_context
+    company_context = get_company_context(request.company)
+
+    # Fetch user's language preference
+    from db.database import get_user_settings
+    settings = await get_user_settings(telegram_id)
+    language = settings.get("language", "en")
+
+    step_data = await generate_sd_step(
+        problem=request.problem,
+        role="System Design",
+        level=request.level,
+        step=1,
+        previous_context="",
+        company_context=company_context,
+        language=language,
+        model=model,
+    )
+
+    return {
+        "session_id": sd_session.id,
+        "step": 1,
+        "step_name": step_data.get("step_name", "Requirements Clarification"),
+        "prompt": step_data.get("prompt", ""),
+        "hints": step_data.get("hints", []),
+        "total_steps": 7,
+    }
+
+
+@router.post("/system-design/step")
+async def sd_step(
+    request: SystemDesignStepRequest,
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Submit an answer for the current step and get the next one."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    plan = await get_user_plan_name(telegram_id)
+    if plan == "Free":
+        raise HTTPException(status_code=403, detail="Premium feature")
+
+    from db.models import SystemDesignSession
+
+    async with async_session() as s:
+        sd = await s.get(SystemDesignSession, request.session_id)
+        if not sd:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if sd.completed:
+            raise HTTPException(status_code=400, detail="Session already completed")
+
+        current_step = sd.current_step
+        step_context = json.loads(sd.step_context or "[]")
+        step_scores = json.loads(sd.step_scores or "[]")
+
+    prev_step_data = step_context[-1] if step_context else {}
+    context_lines = []
+    for sc in step_context:
+        context_lines.append(f"Step {sc['step']} ({sc['step_name']}):\nPrompt: {sc['prompt']}\nAnswer: {sc['answer']}")
+    previous_context = "\n\n".join(context_lines)
+
+    model = _resolve_model(plan)
+    from ai.prompts import _SD_STEP_NAMES
+    from db.database import get_user_settings
+
+    # Fetch user's language preference
+    settings = await get_user_settings(telegram_id)
+    language = settings.get("language", "en")
+
+    step_name = _SD_STEP_NAMES.get(current_step, f"Step {current_step}")
+
+    eval_result = await evaluate_sd_step(
+        problem=sd.problem,
+        step=current_step,
+        step_name=step_name,
+        level=sd.level,
+        step_prompt="",
+        answer=request.answer,
+        previous_context=previous_context,
+        language=language,
+        model=model,
+    )
+
+    score = eval_result.get("score", 5)
+    feedback = eval_result.get("feedback", "")
+
+    step_context.append({
+        "step": current_step,
+        "step_name": step_name,
+        "prompt": prev_step_data.get("prompt", ""),
+        "answer": request.answer,
+        "score": score,
+        "feedback": feedback,
+    })
+    step_scores.append({"step": current_step, "score": score})
+
+    is_last_step = current_step >= 7
+
+    if is_last_step:
+        all_context = "\n\n".join(
+            f"Step {sc['step']} ({sc['step_name']}):\nPrompt: {sc['prompt']}\nAnswer: {sc['answer']}\nScore: {sc['score']}/10"
+            for sc in step_context
+        )
+
+        summary = await generate_sd_summary(
+            problem=sd.problem,
+            level=sd.level,
+            all_context=all_context,
+            language=language,
+            model=model,
+        )
+
+        async with async_session() as s:
+            sd_obj = await s.get(SystemDesignSession, request.session_id)
+            sd_obj.current_step = current_step + 1
+            sd_obj.step_scores = json.dumps(step_scores)
+            sd_obj.step_context = json.dumps(step_context)
+            sd_obj.summary = json.dumps(summary)
+            sd_obj.completed = True
+            sd_obj.total_score = summary.get("overall", 5)
+            await s.commit()
+
+        return {
+            "done": True,
+            "step": current_step,
+            "score": score,
+            "feedback": feedback,
+            "evaluation": summary,
+            "next_prompt": None,
+            "next_hints": [],
+        }
+
+    next_step = current_step + 1
+    company_context = ""
+    if sd.company:
+        from api.companies import get_company_context
+        company_context = get_company_context(sd.company)
+
+    next_step_data = await generate_sd_step(
+        problem=sd.problem,
+        role="System Design",
+        level=sd.level,
+        step=next_step,
+        previous_context=previous_context,
+        company_context=company_context,
+        language=language,
+        model=model,
+    )
+
+    async with async_session() as s:
+        sd_obj = await s.get(SystemDesignSession, request.session_id)
+        sd_obj.current_step = next_step
+        sd_obj.step_scores = json.dumps(step_scores)
+        sd_obj.step_context = json.dumps(step_context)
+        await s.commit()
+
+    return {
+        "done": False,
+        "step": next_step,
+        "step_name": next_step_data.get("step_name", f"Step {next_step}"),
+        "prompt": next_step_data.get("prompt", ""),
+        "hints": next_step_data.get("hints", []),
+        "score": score,
+        "feedback": feedback,
+        "evaluation": None,
+    }
+
+
+@router.get("/system-design/session/{session_id}")
+async def sd_session_detail(
+    session_id: int,
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Return full details of a System Design session (for viewing results or resuming)."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    from db.models import SystemDesignSession
+
+    async with async_session() as s:
+        sd = await s.get(SystemDesignSession, session_id)
+        if not sd:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        db_user_id = await _get_db_user_id(telegram_id)
+        if sd.user_id != db_user_id:
+            raise HTTPException(status_code=403, detail="Not your session")
+
+        step_context = json.loads(sd.step_context or "[]")
+        step_scores = json.loads(sd.step_scores or "[]")
+        summary = json.loads(sd.summary) if sd.summary else None
+
+    return {
+        "id": sd.id,
+        "problem": sd.problem,
+        "level": sd.level,
+        "company": sd.company,
+        "completed": sd.completed,
+        "current_step": sd.current_step,
+        "total_steps": 7,
+        "total_score": sd.total_score,
+        "step_context": step_context,
+        "step_scores": step_scores,
+        "summary": summary,
+        "started_at": sd.started_at.isoformat() if sd.started_at else None,
+    }
+
+
+@router.get("/system-design/history")
+async def sd_history(
+    user_data: dict = Depends(get_current_user),
+) -> dict:
+    """Return the user's System Design session history."""
+    telegram_id = user_data.get("id", 0)
+    if telegram_id <= 0:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    from db.models import SystemDesignSession
+    from sqlalchemy import select, desc
+
+    async with async_session() as s:
+        db_user_id = await _get_db_user_id(telegram_id)
+        result = await s.execute(
+            select(SystemDesignSession)
+            .where(SystemDesignSession.user_id == db_user_id)
+            .order_by(desc(SystemDesignSession.started_at))
+            .limit(50)
+        )
+        sessions = result.scalars().all()
+
+    return {
+        "sessions": [
+            {
+                "id": sd.id,
+                "problem": sd.problem,
+                "level": sd.level,
+                "completed": sd.completed,
+                "total_score": sd.total_score,
+                "started_at": sd.started_at.isoformat() if sd.started_at else None,
+                "current_step": sd.current_step,
+            }
+            for sd in sessions
+        ],
+    }
