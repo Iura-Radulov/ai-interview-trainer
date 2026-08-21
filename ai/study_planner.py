@@ -111,7 +111,10 @@ async def generate_study_plan(
     if not session_data:
         raise ValueError("No session data provided for study plan generation")
 
-    client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+    client = AsyncOpenAI(
+        api_key=config.OPENAI_CHAT_API_KEY or config.OPENAI_API_KEY,
+        base_url=config.OPENAI_BASE_URL,
+    )
     lang_inst = _LANGUAGE_MAP.get(language, _LANGUAGE_MAP["en"])
 
     # Compute aggregate stats

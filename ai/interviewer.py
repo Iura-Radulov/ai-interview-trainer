@@ -204,7 +204,10 @@ def _get_client() -> AsyncOpenAI:
     """Lazily create and cache the OpenAI async client."""
     global _client
     if _client is None:
-        _client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+        _client = AsyncOpenAI(
+            api_key=config.OPENAI_CHAT_API_KEY or config.OPENAI_API_KEY,
+            base_url=config.OPENAI_BASE_URL,
+        )
     return _client
 
 

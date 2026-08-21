@@ -83,7 +83,10 @@ async def analyze_gap(
             profile_summary, overall_fit, strengths[], gaps[],
             focus_areas[], expected_difficulty, preparation_tip
     """
-    client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+    client = AsyncOpenAI(
+        api_key=config.OPENAI_CHAT_API_KEY or config.OPENAI_API_KEY,
+        base_url=config.OPENAI_BASE_URL,
+    )
     lang_inst = _LANGUAGE_MAP.get(language, _LANGUAGE_MAP["en"])
     tech_stack_str = ", ".join(tech_stack) if tech_stack else "Not specified"
     key_skills_str = ", ".join(key_skills) if key_skills else "Not specified"

@@ -1820,7 +1820,10 @@ async def _generate_company_context(
 
     try:
         from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+        client = AsyncOpenAI(
+            api_key=config.OPENAI_CHAT_API_KEY or config.OPENAI_API_KEY,
+            base_url=config.OPENAI_BASE_URL,
+        )
         response = await client.chat.completions.create(
             model=config.OPENAI_MODEL,
             messages=[

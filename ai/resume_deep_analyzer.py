@@ -20,7 +20,10 @@ Return a JSON object with these fields:
 
 async def analyze_resume_deep(pdf_text: str, target_role: str, experience_level: str, company_context: str = "") -> dict:
     try:
-        client = OpenAI(api_key=config.OPENAI_API_KEY)
+        client = OpenAI(
+            api_key=config.OPENAI_CHAT_API_KEY or config.OPENAI_API_KEY,
+            base_url=config.OPENAI_BASE_URL,
+        )
         user_prompt = f"Target Role: {target_role}\nExperience Level: {experience_level}\n"
         if company_context:
             user_prompt += f"Company Context: {company_context}\n"
