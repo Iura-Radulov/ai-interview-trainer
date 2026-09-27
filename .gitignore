@@ -1,5 +1,11 @@
 # Environment
 .env
+.env.bak*
+*.bak-*
+
+# Logs (bot.log leaked a live bot token through httpx request logging)
+*.log
+logs/
 
 # Database
 *.db

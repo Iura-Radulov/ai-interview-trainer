@@ -9,7 +9,7 @@ import os
 import tempfile
 
 import fitz
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import select, text
@@ -104,15 +104,65 @@ class MarkDayRequest(BaseModel):
 
 # ── Auth dependency ───────────────────────────────────────────────────────────
 
+SESSION_COOKIE = "session"
+
+
+def _verify_session_cookie(token: str) -> Optional[int]:
+    """Verify an HS256 session JWT issued by the landing; return its telegram_id.
+
+    Written against the stdlib so the API needs no JWT dependency. Returns None
+    for anything that is not a valid, unexpired token signed with JWT_SECRET.
+    """
+    try:
+        import base64
+        import hmac
+        import json as _json
+        import time as _time
+
+        secret = config.JWT_SECRET
+        if not secret:
+            logger.error("JWT_SECRET is not set — cannot verify session cookies")
+            return None
+
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        header_b64, payload_b64, sig_b64 = parts
+
+        def _b64(s: str) -> bytes:
+            return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+        expected = hmac.new(
+            secret.encode(), f"{header_b64}.{payload_b64}".encode(), hashlib.sha256
+        ).digest()
+        if not hmac.compare_digest(expected, _b64(sig_b64)):
+            return None
+
+        payload = _json.loads(_b64(payload_b64))
+        exp = payload.get("exp")
+        if exp is not None and int(exp) < int(_time.time()):
+            return None
+
+        telegram_id = payload.get("telegramId")
+        return int(telegram_id) if telegram_id else None
+    except Exception as exc:
+        logger.warning("session cookie verification failed: %s", exc)
+        return None
+
 
 async def get_current_user(
+    request: Request,
     x_telegram_init_data: Optional[str] = Header(None),
-    x_user_id: Optional[int] = Header(None),
 ) -> dict:
-    """Validate X-Telegram-Init-Data header and ensure user exists in DB.
+    """Resolve the current user, or raise 401.
 
-    Falls back to X-User-ID header (from landing site auth) if no init data.
-    Falls back to a guest user if neither is provided (MVP mode).
+    Accepts, in order:
+      1. Telegram initData (Mini App) — HMAC-verified with the bot token.
+      2. The landing's signed session cookie — HMAC-verified with JWT_SECRET.
+
+    There is deliberately NO guest fallback and NO trust in a caller-supplied id
+    header: either the identity is cryptographically proven, or the request is
+    rejected. A `Depends()` that never returns 401 is not authentication.
     """
     if x_telegram_init_data:
         user_data = validate_init_data(x_telegram_init_data)
@@ -129,11 +179,19 @@ async def get_current_user(
                     logger.error("get_or_create_user failed: %s", exc)
                 return user_data
 
-    # Fallback: X-User-ID from landing auth
-    if x_user_id and x_user_id > 0:
-        return {"id": x_user_id, "username": None, "first_name": "Web User"}
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        telegram_id = _verify_session_cookie(token)
+        if telegram_id:
+            try:
+                await get_or_create_user(
+                    telegram_id=telegram_id, username=None, first_name=None
+                )
+            except Exception as exc:
+                logger.error("get_or_create_user failed: %s", exc)
+            return {"id": telegram_id, "username": None, "first_name": "Web User"}
 
-    return {"id": 0, "username": None, "first_name": "Guest"}
+    raise HTTPException(status_code=401, detail="Not authenticated")
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────

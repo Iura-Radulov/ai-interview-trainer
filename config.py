@@ -19,6 +19,11 @@ FEEDBACK_CHAT_ID: str = os.getenv("FEEDBACK_CHAT_ID", "")
 MAX_FREE_INTERVIEWS_PER_MONTH: int = int(os.getenv("MAX_FREE_INTERVIEWS_PER_MONTH", "2"))
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
+# Shared with the landing (interview-landing) — used to verify its session
+# cookie. No default on purpose: an unset secret must never fall back to a
+# hardcoded value.
+JWT_SECRET: str = os.getenv("JWT_SECRET", "")
+
 QUESTIONS_PER_SESSION: int = 5
 SESSION_TIMEOUT_MINUTES: int = 30
 
